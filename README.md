@@ -110,91 +110,166 @@ pip install psutil requests
 - **Heat Stress** (5 params): Wet bulb temperature, WBGT, heat indices
 - **Updraft Helicity** (5 params): Various layer calculations for tornado potential
 
-## 🎯 Command Examples
+## 🎯 Workflow Examples
 
-### Basic Processing
-
-```bash
-# Process latest available HRRR run (all products)
-python processor_cli.py --latest
-
-# Process specific date/hour
-python processor_cli.py 20250715 12
-
-# Process only specific categories
-python processor_cli.py 20250715 12 --categories severe,instability
-
-# Process specific parameters
-python processor_cli.py 20250715 12 --fields sbcape,sbcin,stp,reflectivity_comp
-
-# Process specific forecast hours (default is F00-F18)
-python processor_cli.py 20250715 12 --hours 0-6
-
-# Process extended forecast (for 00z, 06z, 12z, 18z runs)
-python processor_cli.py 20250715 12 --hours 0-48
-```
-
-
-### Model Selection
+### 1. 🌪️ **Severe Weather Analysis** - Complete Outbreak Assessment
 
 ```bash
-# Process RRFS model (experimental)
-python processor_cli.py --latest --model rrfs
+# Generate all severe weather products for extended forecast
+python processor_cli.py 20250515 18 --hours 0-24 --categories severe,instability --workers 8
 
-# Process GFS model
-python processor_cli.py --latest --model gfs
-```
-
-### Parallel Processing Control
-
-```bash
-# Use 4 worker processes (default: auto-detect)
-python processor_cli.py --latest --workers 4
-
-# Force reprocess all products (ignore existing)
-python processor_cli.py 20250715 12 --force
-
-# Enable debug logging
-python processor_cli.py --latest --debug
-
-# Enable detailed meteorological debugging
-HRRR_DEBUG=1 python processor_cli.py --latest
-```
-
-### Continuous Monitoring
-
-```bash
-# Monitor and process new HRRR runs as they arrive
-python monitor_continuous.py
-
-# The monitor will:
-# - Check for new data every 10 seconds
-# - Process only missing forecast hours
-# - Show progress for each cycle
-# - Continue from previous cycle if new data isn't ready
-```
-
-### Creating Animations (GIFs)
-
-```bash
-# Step 1: Generate images for multiple forecast hours
-python processor_cli.py 20250813 21 --hours 0-12 --categories smoke
-
-# Step 2: Create animated GIFs
+# Create tornado parameter animations
 cd tools
-python create_gifs.py 20250813 21z --categories smoke --max-hours 12
+python create_gifs.py 20250515 18z --categories severe --max-hours 24 --duration 400
 
-# Create GIFs for all categories
-python create_gifs.py 20250813 21z
+# Quick check specific tornado parameters
+cd ..
+python processor_cli.py 20250515 18 --hours 0-12 --fields stp,srh_01km,effective_shear --debug
 
-# Create faster animations (300ms per frame instead of 250ms)
-python create_gifs.py 20250813 21z --duration 300
-
-# Create animations for specific categories only
-python create_gifs.py 20250813 21z --categories severe,instability,smoke
+# Output: Full severe weather analysis with 24-hour tornado parameter animations
 ```
 
-**Output:** GIFs are saved to `outputs/hrrr/YYYYMMDD/HHz/animations/category/`
+### 2. 🔥 **Fire Weather Monitoring** - Real-time Smoke Tracking
+
+```bash
+# Monitor latest runs continuously for fire weather
+python monitor_continuous.py &
+
+# Process current smoke conditions for short-term forecast
+python processor_cli.py --latest --categories smoke,fire --hours 0-6
+
+# Create smoke evolution animations
+cd tools  
+python create_gifs.py $(date +%Y%m%d) $(date +%H)z --categories smoke --max-hours 6 --duration 250
+
+# Output: Real-time smoke and fire weather products with 6-hour animations
+```
+
+### 3. ⛈️ **Nowcasting Setup** - Rapid Updates for Current Conditions
+
+```bash
+# Process latest run with reflectivity and surface conditions
+python processor_cli.py --latest --categories reflectivity,surface,severe --hours 0-3 --workers 4
+
+# Create rapid-update animations for nowcasting
+cd tools
+python create_gifs.py --latest --categories reflectivity --max-hours 3 --duration 200
+
+# Generate single-hour snapshots for briefings
+cd ..
+python processor_cli.py --latest --hours 0 --categories severe,instability,surface
+
+# Output: Fast nowcasting products with 3-hour high-speed animations
+```
+
+### 4. 🌡️ **Heat Stress Analysis** - Summer Operations Planning
+
+```bash
+# Process heat stress parameters for extended forecast
+python processor_cli.py 20250715 12 --hours 0-48 --categories heat,surface --workers 6
+
+# Focus on peak heating hours (18-00Z)
+python processor_cli.py 20250715 12 --hours 6-12 --fields wbgt_estimated_outdoor,wet_bulb_temperature,t2m
+
+# Create heat index animations for planning
+cd tools
+python create_gifs.py 20250715 12z --categories heat --max-hours 48 --duration 500
+
+# Quick wet-bulb temperature check
+cd ..
+python processor_cli.py 20250715 12 --hours 6-12 --fields wet_bulb_temperature --debug
+
+# Output: Complete heat stress analysis with 48-hour planning animations
+```
+
+### 5. 📊 **Research Dataset Creation** - Multi-Parameter Analysis
+
+```bash
+# Generate comprehensive dataset for case study
+python processor_cli.py 20250604 00 --hours 0-48 --workers 8  # All categories
+
+# Create parameter-specific animations
+cd tools
+python create_gifs.py 20250604 00z --categories severe,instability --max-hours 48 --duration 350
+python create_gifs.py 20250604 00z --categories smoke,fire --max-hours 48 --duration 350  
+python create_gifs.py 20250604 00z --categories reflectivity --max-hours 48 --duration 300
+
+# Extract specific parameters for analysis
+cd ..
+python processor_cli.py 20250604 00 --fields stp,ship,sbcape,mlcape,srh_01km --hours 0-48
+
+# Generate verification dataset
+python processor_cli.py 20250604 06 --hours 0-42  # 6Z run for comparison
+python processor_cli.py 20250604 12 --hours 0-36  # 12Z run for comparison
+
+# Output: Multi-run research dataset with comprehensive animations
+```
+
+### 6. 🎯 **Operational Monitoring** - Continuous Weather Surveillance
+
+```bash
+# Set up continuous monitoring with specific focus
+python monitor_continuous.py &
+
+# Manual processing for critical updates
+python processor_cli.py --latest --categories severe,reflectivity --hours 0-6 --workers 4
+
+# Create real-time situation awareness products
+cd tools
+python create_gifs.py --latest --categories severe --max-hours 6 --duration 300
+
+# Check system status and recent products
+cd ..
+ls outputs/hrrr/$(date +%Y%m%d)/*/animations/*/
+
+# Debug specific parameter if needed
+HRRR_DEBUG=1 python processor_cli.py --latest --fields updraft_helicity_02km --hours 0-3
+
+# Output: Continuous operational monitoring with automated updates
+```
+
+## 🔧 Advanced Commands
+
+### Model Selection & Debugging
+
+```bash
+# Process different models
+python processor_cli.py --latest --model rrfs  # RRFS experimental
+python processor_cli.py --latest --model gfs   # GFS global
+
+# Force reprocessing with enhanced debugging
+python processor_cli.py 20250715 12 --force --debug --workers 1
+HRRR_DEBUG=1 python processor_cli.py 20250715 12 --categories severe
+
+# Check data availability
+python processor_cli.py 20250715 12 --check-availability
+```
+
+### Batch Processing & Utilities
+
+```bash
+# Process multiple categories efficiently
+python processor_cli.py 20250715 12 --categories "severe,instability,smoke" --workers 8
+
+# Quick field listing
+python processor_cli.py --list-fields --category severe
+
+# Test single parameter
+python processor_cli.py --latest --fields sbcape --debug
+```
+
+## 📋 Quick Reference - Common Use Cases
+
+| **Use Case** | **Command** | **Output** |
+|--------------|-------------|------------|
+| **Latest severe weather** | `python processor_cli.py --latest --categories severe` | Current severe weather maps |
+| **Tornado parameters now** | `python processor_cli.py --latest --fields stp,srh_01km --hours 0-3` | 3-hour tornado parameter evolution |
+| **Smoke conditions today** | `python processor_cli.py --latest --categories smoke --hours 0-12` | 12-hour smoke forecast |
+| **Quick reflectivity check** | `python processor_cli.py --latest --fields reflectivity_comp --hours 0-1` | Current radar composite |
+| **Heat stress planning** | `python processor_cli.py --latest --categories heat --hours 6-12` | Peak heating period analysis |
+| **Research case study** | `python processor_cli.py 20250604 00 --hours 0-48 --workers 8` | Complete 48-hour dataset |
+| **Severe weather animation** | `cd tools && python create_gifs.py YYYYMMDD HHz --categories severe --max-hours 24` | 24-hour tornado parameter movies |
+| **Operational monitoring** | `python monitor_continuous.py` | Continuous auto-processing |
 
 ### Advanced Features
 
