@@ -1,35 +1,23 @@
-from .common import *
+from .common import _dbg
 from ._mixing_ratio_approximation import _mixing_ratio_approximation
+from ._psychrometrics import e_from_dewpoint_pa, mixing_ratio_from_e, _to_pa
+import numpy as np
 
-def mixing_ratio_2m(dewpoint_2m: np.ndarray, pressure: np.ndarray) -> np.ndarray:
+def mixing_ratio_2m(dewpoint_2m, pressure):
     """
-    Compute 2m mixing ratio
-    
-    Args:
-        dewpoint_2m: 2m dewpoint temperature (°C)
-        pressure: Surface pressure (Pa)
-        
-    Returns:
-        Mixing ratio (g/kg)
+    Compute 2m mixing ratio (g/kg). Pressure may be Pa or hPa (auto-detected).
     """
-    if METPY_AVAILABLE:
-        try:
-            dwpt = dewpoint_2m * units.celsius
-            
-            # Convert pressure from mb to Pa if needed
-            if np.mean(pressure) < 2000:  # Likely in mb
-                pres = pressure * 100 * units.pascal
-            else:
-                pres = pressure * units.pascal
-            
-            # Calculate saturation vapor pressure at dewpoint
-            es = 6.112 * np.exp(17.67 * dewpoint_2m / (dewpoint_2m + 243.5)) * units.hectopascal
-            
-            mix_ratio = mixing_ratio(saturation_vapor_pressure=es, pressure=pres)
-            
-            return mix_ratio.to('gram/kilogram').magnitude
-        except Exception as e:
-            print(f"MetPy mixing ratio failed: {e}, using fallback")
-    
-    # Fallback calculation
-    return _mixing_ratio_approximation(dewpoint_2m, pressure)
+    try:
+        P_pa = _to_pa(pressure)
+        e = e_from_dewpoint_pa(dewpoint_2m)
+        w = mixing_ratio_from_e(P_pa, e)           # kg/kg
+        mr_gkg = 1000.0 * w
+        mr_gkg = np.maximum(mr_gkg, 0.0)           # non-negative
+        bad = ~np.isfinite(mr_gkg)
+        if np.any(bad) and (np.mean(bad) > 0.1):
+            raise RuntimeError("excess NaNs in mixing_ratio_2m")
+        out_dtype = np.result_type(dewpoint_2m, pressure, np.float32)
+        return mr_gkg.astype(out_dtype, copy=False)
+    except Exception as e:
+        _dbg(f"Mixing ratio exact failed ({e}); using fallback approximation.")
+        return _mixing_ratio_approximation(dewpoint_2m, pressure)

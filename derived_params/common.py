@@ -8,21 +8,20 @@ import numpy as np
 import xarray as xr
 from typing import Dict, Any, Optional, Tuple
 import warnings
+import os
+import sys
 
-# MetPy integration for advanced meteorological calculations
-try:
-    from metpy.calc import (
-        heat_index, wind_chill, mixing_ratio, wind_speed, wind_direction,
-        potential_temperature, equivalent_potential_temperature, 
-        wet_bulb_temperature, relative_humidity_from_mixing_ratio,
-        saturation_mixing_ratio, brunt_vaisala_frequency,
-        richardson_number_bulk, gradient_richardson_number
-    )
-    from metpy.units import units
-    METPY_AVAILABLE = True
-except ImportError:
-    print("MetPy not available - some advanced derived parameters will not be computed")
-    METPY_AVAILABLE = False
+# Gravity constant
+G = 9.80665
+
+# Debug logging - accepts true/yes/on/1
+_debug_val = os.getenv("HRRR_DEBUG", "0").lower()
+DEBUG = _debug_val in ("1", "true", "yes", "on")
+
+def _dbg(msg):
+    """Debug logging function - only outputs when HRRR_DEBUG is truthy"""
+    if DEBUG:
+        print(msg, file=sys.stderr)
 
 
 def cin_gate(cin: np.ndarray, hi: float = -50.0, lo: float = -100.0) -> np.ndarray:

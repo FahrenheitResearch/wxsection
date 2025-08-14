@@ -19,6 +19,7 @@ from .energy_helicity_index_01km import energy_helicity_index_01km
 from .wind_shear_magnitude import wind_shear_magnitude
 from .updraft_helicity_threshold import updraft_helicity_threshold
 from .composite_severe_index import composite_severe_index
+from .wet_bulb_temperature import wet_bulb_temperature
 from .wet_bulb_temperature_metpy import wet_bulb_temperature_metpy
 from ._wet_bulb_approximation import _wet_bulb_approximation
 from .wbgt_shade import wbgt_shade
@@ -88,7 +89,8 @@ _DERIVED_FUNCTIONS = {
     'wind_shear_magnitude': wind_shear_magnitude,
     'updraft_helicity_threshold': updraft_helicity_threshold,
     'composite_severe_index': composite_severe_index,
-    'wet_bulb_temperature_metpy': wet_bulb_temperature_metpy,
+    'wet_bulb_temperature': wet_bulb_temperature,
+    'wet_bulb_temperature_metpy': wet_bulb_temperature,  # legacy alias
     '_wet_bulb_approximation': _wet_bulb_approximation,
     'wbgt_shade': wbgt_shade,
     'wbgt_estimated_outdoor': wbgt_estimated_outdoor,
@@ -329,7 +331,8 @@ class DerivedParameters:
     wind_shear_magnitude = staticmethod(wind_shear_magnitude)
     updraft_helicity_threshold = staticmethod(updraft_helicity_threshold)
     composite_severe_index = staticmethod(composite_severe_index)
-    wet_bulb_temperature_metpy = staticmethod(wet_bulb_temperature_metpy)
+    wet_bulb_temperature = staticmethod(wet_bulb_temperature)
+    wet_bulb_temperature_metpy = staticmethod(wet_bulb_temperature)  # legacy alias
     _wet_bulb_approximation = staticmethod(_wet_bulb_approximation)
     wbgt_shade = staticmethod(wbgt_shade)
     wbgt_estimated_outdoor = staticmethod(wbgt_estimated_outdoor)
