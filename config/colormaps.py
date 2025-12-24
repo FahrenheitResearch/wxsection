@@ -127,5 +127,30 @@ def create_all_colormaps():
                        '#ff5722', '#f44336', '#d32f2f',  # 35-45 m/s: orange to red (severe)
                        '#b71c1c', '#880e4f', '#4a148c']  # 45+ m/s: dark red to purple (extreme)
     colormaps['WindGust'] = LinearSegmentedColormap.from_list('WindGust', wind_gust_colors)
-    
+
+    # ============================================================
+    # DIURNAL TEMPERATURE COLORMAPS
+    # ============================================================
+
+    # Diurnal Range - Cool blue (small range) -> Warm amber/orange (moderate) -> Hot red (large swings)
+    # Small DTR = humid/cloudy, Large DTR = arid/clear
+    diurnal_range_colors = ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6',  # 0-10°C: blues (small range)
+                           '#fef0d9', '#fdd49e', '#fdbb84', '#fc8d59',  # 10-20°C: oranges (moderate)
+                           '#e34a33', '#b30000', '#7f0000']  # 20-30+°C: reds (extreme range)
+    colormaps['DiurnalRange'] = LinearSegmentedColormap.from_list('DiurnalRange', diurnal_range_colors)
+
+    # Heating Rate - White/light yellow (slow) -> Orange (moderate) -> Red/Magenta (rapid heating)
+    # Rapid heating = strong insolation, fire weather concern, convective destabilization
+    heating_rate_colors = ['#ffffcc', '#ffeda0', '#fed976', '#feb24c',  # 0-2°C/hr: yellows (gentle)
+                          '#fd8d3c', '#fc4e2a', '#e31a1c',  # 2-4°C/hr: oranges (moderate)
+                          '#bd0026', '#800026', '#67001f']  # 4+°C/hr: reds (rapid)
+    colormaps['HeatingRate'] = LinearSegmentedColormap.from_list('HeatingRate', heating_rate_colors)
+
+    # Cooling Rate - Light cyan (slow) -> Blue (moderate) -> Deep blue/purple (rapid cooling)
+    # Rapid cooling = clear skies, radiational cooling, frost/fog potential
+    cooling_rate_colors = ['#f7fcf0', '#e0f3db', '#ccebc5', '#a8ddb5',  # 0-2°C/hr: light greens (gentle)
+                          '#7bccc4', '#4eb3d3', '#2b8cbe',  # 2-4°C/hr: teals/blues (moderate)
+                          '#0868ac', '#084081', '#081d58']  # 4+°C/hr: deep blues (rapid)
+    colormaps['CoolingRate'] = LinearSegmentedColormap.from_list('CoolingRate', cooling_rate_colors)
+
     return colormaps

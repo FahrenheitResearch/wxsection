@@ -1,0 +1,112 @@
+{
+  "dtr": {
+    "title": "Diurnal Temperature Range",
+    "units": "°C",
+    "cmap": "DiurnalRange",
+    "levels": [0, 5, 8, 10, 12, 15, 18, 20, 25, 30],
+    "extend": "max",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "dtr",
+    "description": "Daily temperature range (T_max - T_min). High values indicate clear/dry conditions."
+  },
+  "t_max_diurnal": {
+    "title": "Maximum Temperature (24h)",
+    "units": "°C",
+    "cmap": "RdYlBu_r",
+    "levels": [-20, -10, 0, 10, 20, 25, 30, 35, 40, 45],
+    "extend": "both",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "t_max",
+    "description": "Maximum 2m temperature over the forecast period."
+  },
+  "t_min_diurnal": {
+    "title": "Minimum Temperature (24h)",
+    "units": "°C",
+    "cmap": "RdYlBu_r",
+    "levels": [-30, -20, -10, 0, 5, 10, 15, 20, 25, 30],
+    "extend": "both",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "t_min",
+    "description": "Minimum 2m temperature over the forecast period."
+  },
+  "t_mean_diurnal": {
+    "title": "Mean Temperature (24h)",
+    "units": "°C",
+    "cmap": "RdYlBu_r",
+    "levels": [-20, -10, 0, 10, 15, 20, 25, 30, 35, 40],
+    "extend": "both",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "t_mean",
+    "description": "Mean 2m temperature over the forecast period."
+  },
+  "day_night_diff": {
+    "title": "Day-Night Temperature Difference",
+    "units": "°C",
+    "cmap": "DiurnalRange",
+    "levels": [0, 5, 8, 10, 12, 15, 18, 20, 25, 30],
+    "extend": "max",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "day_night_diff",
+    "description": "Afternoon minus overnight temperature. High values = strong diurnal cycle."
+  },
+  "heating_rate": {
+    "title": "Morning Heating Rate",
+    "units": "°C/hr",
+    "cmap": "HeatingRate",
+    "levels": [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+    "extend": "max",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "heating_rate",
+    "description": "Rate of temperature increase during morning hours. High values = rapid destabilization."
+  },
+  "cooling_rate": {
+    "title": "Evening Cooling Rate",
+    "units": "°C/hr",
+    "cmap": "CoolingRate",
+    "levels": [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+    "extend": "max",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "cooling_rate",
+    "description": "Rate of temperature decrease during evening. High values = clear/dry conditions."
+  },
+  "diurnal_amplitude": {
+    "title": "Diurnal Temperature Amplitude",
+    "units": "°C",
+    "cmap": "DiurnalRange",
+    "levels": [0, 2.5, 5, 7.5, 10, 12.5, 15, 17.5, 20],
+    "extend": "max",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "amplitude",
+    "description": "Half the diurnal range - useful for harmonic analysis."
+  },
+  "hour_of_max_temp": {
+    "title": "Hour of Maximum Temperature",
+    "units": "forecast hour",
+    "cmap": "viridis",
+    "levels": [6, 9, 12, 15, 18, 21, 24],
+    "extend": "both",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "hour_of_max",
+    "description": "Forecast hour when T_max occurs. Earlier = drier conditions."
+  },
+  "hour_of_min_temp": {
+    "title": "Hour of Minimum Temperature",
+    "units": "forecast hour",
+    "cmap": "viridis",
+    "levels": [0, 3, 6, 9, 12, 15, 18],
+    "extend": "both",
+    "category": "diurnal",
+    "diurnal": true,
+    "diurnal_product": "hour_of_min",
+    "description": "Forecast hour when T_min occurs. Typically around sunrise."
+  }
+}

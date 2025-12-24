@@ -85,6 +85,23 @@ from .significant_tornado_parameter_cin import significant_tornado_parameter_cin
 from .violent_tornado_parameter import violent_tornado_parameter
 from .calculate_lapse_rate_700_500 import calculate_lapse_rate_700_500
 
+# Diurnal temperature functions
+from .diurnal_temperature import (
+    diurnal_temperature_range,
+    diurnal_max_temperature,
+    diurnal_min_temperature,
+    diurnal_mean_temperature,
+    day_night_temperature_difference,
+    temperature_departure_from_mean,
+    heating_rate,
+    cooling_rate,
+    hour_of_maximum_temperature,
+    hour_of_minimum_temperature,
+    diurnal_temperature_amplitude,
+    temperature_at_hour,
+    compute_all_diurnal_products
+)
+
 # Create a dispatch table of all available functions
 _DERIVED_FUNCTIONS = {
     'supercell_composite_parameter': supercell_composite_parameter,
@@ -164,6 +181,20 @@ _DERIVED_FUNCTIONS = {
     'violent_tornado_parameter': violent_tornado_parameter,
     'calculate_lapse_rate_700_500': calculate_lapse_rate_700_500,
     'identity': identity,
+    # Diurnal temperature functions
+    'diurnal_temperature_range': diurnal_temperature_range,
+    'diurnal_max_temperature': diurnal_max_temperature,
+    'diurnal_min_temperature': diurnal_min_temperature,
+    'diurnal_mean_temperature': diurnal_mean_temperature,
+    'day_night_temperature_difference': day_night_temperature_difference,
+    'temperature_departure_from_mean': temperature_departure_from_mean,
+    'heating_rate': heating_rate,
+    'cooling_rate': cooling_rate,
+    'hour_of_maximum_temperature': hour_of_maximum_temperature,
+    'hour_of_minimum_temperature': hour_of_minimum_temperature,
+    'diurnal_temperature_amplitude': diurnal_temperature_amplitude,
+    'temperature_at_hour': temperature_at_hour,
+    'compute_all_diurnal_products': compute_all_diurnal_products,
 }
 
 
