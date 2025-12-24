@@ -57,8 +57,14 @@ def create_interactive_map(
         center_lon = (lon_min + lon_max) / 2
 
         # Get value range for colormap
-        vmin = field_config.get('vmin', float(np.nanmin(values)))
-        vmax = field_config.get('vmax', float(np.nanmax(values)))
+        # Use levels if available, otherwise vmin/vmax, otherwise data range
+        levels = field_config.get('levels')
+        if levels and len(levels) >= 2:
+            vmin = float(min(levels))
+            vmax = float(max(levels))
+        else:
+            vmin = field_config.get('vmin', float(np.nanmin(values)))
+            vmax = field_config.get('vmax', float(np.nanmax(values)))
 
         # Handle data - minimal subsampling for quality
         # Full HRRR grid is ~1059x1799, subsample to ~530x900 for good quality
@@ -136,7 +142,7 @@ def create_interactive_map(
         units = field_config.get('units', '')
         title = field_config.get('title', field_name)
 
-        # Add custom JavaScript for hover display
+        # Add custom JavaScript for hover display and opacity control
         hover_js = f"""
         <script>
         var weatherData = {{
@@ -192,7 +198,14 @@ def create_interactive_map(
             info.innerHTML = '<b>{title}</b><br>Hover over map for values';
             document.body.appendChild(info);
 
-            // Add mousemove listener
+            // Create opacity slider
+            var sliderDiv = document.createElement('div');
+            sliderDiv.style.cssText = 'position:fixed;bottom:80px;left:10px;z-index:1000;background:white;padding:10px;border-radius:5px;box-shadow:0 2px 5px rgba(0,0,0,0.3);';
+            sliderDiv.innerHTML = '<label style="font-weight:bold;">Opacity: <span id="opacity-val">70%</span></label><br>' +
+                '<input type="range" id="opacity-slider" min="0" max="100" value="70" style="width:150px;">';
+            document.body.appendChild(sliderDiv);
+
+            // Add mousemove and opacity control
             setTimeout(function() {{
                 var leafletMap = Object.values(window).find(v => v && v._leaflet_id);
                 if (leafletMap && leafletMap.on) {{
@@ -206,6 +219,19 @@ def create_interactive_map(
                                 'Lon: ' + lon.toFixed(2) + '°<br>' +
                                 '<b>Value: ' + val + ' {units}</b>';
                         }}
+                    }});
+
+                    // Find the image overlay and connect opacity slider
+                    var slider = document.getElementById('opacity-slider');
+                    var opacityVal = document.getElementById('opacity-val');
+                    slider.addEventListener('input', function() {{
+                        var opacity = this.value / 100;
+                        opacityVal.textContent = this.value + '%';
+                        // Find all image overlays
+                        var overlays = document.querySelectorAll('.leaflet-image-layer');
+                        overlays.forEach(function(overlay) {{
+                            overlay.style.opacity = opacity;
+                        }});
                     }});
                 }}
             }}, 500);
