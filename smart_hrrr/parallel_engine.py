@@ -299,7 +299,11 @@ class OptimizedHRRRProcessor(HRRRProcessor):
         
         for category, fields in categories_dict.items():
             # Create category output directory
-            cat_output_dir = output_dir / 'conus' / f'F{forecast_hour:02d}' / category
+            # If output_dir is already the F## directory, just add category
+            if output_dir.name.startswith('F') and output_dir.name[1:].isdigit():
+                cat_output_dir = output_dir / category
+            else:
+                cat_output_dir = output_dir / f'F{forecast_hour:02d}' / category
             cat_output_dir.mkdir(parents=True, exist_ok=True)
             
             for field_name, field_config in fields:

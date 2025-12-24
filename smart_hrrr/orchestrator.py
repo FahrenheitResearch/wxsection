@@ -5,6 +5,7 @@ import subprocess
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .utils import check_system_memory
 from .products import get_available_products, get_missing_products, check_existing_products
@@ -16,6 +17,33 @@ from processor_base import HRRRProcessor  # keeps compatibility path
 def _use_parallel_default() -> bool:
     """Check if parallel processing should be used by default"""
     return os.environ.get('HRRR_USE_PARALLEL', 'true').lower() in ('1', 'true', 'yes', 'on')
+
+
+def download_gribs_parallel(cycle: str, forecast_hours: List[int], output_dirs: Dict[str, Path],
+                            model: str, max_threads: int = 8) -> Dict[int, bool]:
+    """Download GRIB files for multiple forecast hours in parallel using threads.
+
+    Returns dict mapping forecast_hour -> success status
+    """
+    logger = logging.getLogger(__name__)
+
+    def download_single(fhr: int) -> tuple[int, bool]:
+        fhr_dir = get_forecast_hour_dir(output_dirs["run"], fhr)
+        start = time.time()
+        ok = download_grib_to_forecast_dir(cycle, fhr, fhr_dir, model)
+        dur = time.time() - start
+        if ok:
+            logger.info(f"  F{fhr:02d} downloaded ({dur:.1f}s)")
+        return fhr, ok
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = {executor.submit(download_single, fhr): fhr for fhr in forecast_hours}
+        for future in as_completed(futures):
+            fhr, ok = future.result()
+            results[fhr] = ok
+
+    return results
 
 
 def download_grib_to_forecast_dir(cycle: str, forecast_hour: int, fhr_dir: Path, model: str) -> bool:
@@ -93,9 +121,11 @@ def process_forecast_hour_smart(
 
         logger.info(f"F{forecast_hour:02d}: {len(existing)} existing, {len(missing)} missing")
 
-    # STEP 1: Download GRIB files to forecast hour directory (shared by all categories)
-    logger.info(f"Downloading GRIB files for F{forecast_hour:02d}")
-    _ = download_grib_to_forecast_dir(cycle, forecast_hour, fhr_dir, model)
+    # STEP 1: Download GRIB files if not already present
+    existing_gribs = list(fhr_dir.glob("*.grib2"))
+    if len(existing_gribs) < 2:
+        logger.info(f"Downloading GRIB files for F{forecast_hour:02d}")
+        _ = download_grib_to_forecast_dir(cycle, forecast_hour, fhr_dir, model)
 
     # STEP 2: Process all categories using parallel approach
     use_parallel = _use_parallel_default() and not fields
@@ -230,8 +260,12 @@ def monitor_and_process_latest(
     hour_range: Optional[List[int]] = None,
     max_hours: Optional[int] = None,
     model: str = "hrrr",
+    download_threads: int = 8,
 ):
-    """Monitor for new forecast hours and process them as they become available"""
+    """Monitor for new forecast hours and process them as they become available.
+
+    Uses parallel GRIB downloads for speed, then processes each hour sequentially.
+    """
     from .availability import get_latest_cycle, get_expected_max_forecast_hour, check_forecast_hour_availability
 
     logger = logging.getLogger(__name__)
@@ -256,7 +290,7 @@ def monitor_and_process_latest(
         forecast_hours = list(range(0, expected_max_fhr + 1))
 
     processed_hours = set()
-    available_hours = set()
+    downloaded_hours = set()
     consecutive_no_new = 0
     max_consec = 10
 
@@ -264,25 +298,44 @@ def monitor_and_process_latest(
         while True:
             logger.info("Checking for new forecast hours...")
 
-            new_found = False
+            # Find all newly available hours
+            newly_available = []
             for fhr in forecast_hours:
                 if fhr in processed_hours:
                     continue
-
                 available_files = check_forecast_hour_availability(cycle, fhr)
-                if available_files:
-                    if fhr not in available_hours:
-                        logger.info(f"New forecast hour: F{fhr:02d} ({', '.join(available_files)})")
-                        available_hours.add(fhr)
-                        new_found = True
+                if available_files and fhr not in downloaded_hours:
+                    logger.info(f"New forecast hour: F{fhr:02d} ({', '.join(available_files)})")
+                    newly_available.append(fhr)
 
-                    res = process_forecast_hour_smart(cycle, fhr, output_dirs, categories, fields, force_reprocess, model)
-                    if res["success"]:
-                        processed_hours.add(fhr)
-                    else:
-                        logger.error(f"F{fhr:02d} failed: {res.get('error')}")
+            if newly_available:
+                consecutive_no_new = 0
 
-            consecutive_no_new = 0 if new_found else consecutive_no_new + 1
+                # Parallel download all newly available GRIB files
+                logger.info(f"Downloading GRIB files for {len(newly_available)} hours with {download_threads} threads...")
+                download_start = time.time()
+                download_results = download_gribs_parallel(cycle, newly_available, output_dirs, model, download_threads)
+                download_dur = time.time() - download_start
+
+                success_count = sum(1 for ok in download_results.values() if ok)
+                logger.info(f"Downloads complete: {success_count}/{len(newly_available)} in {download_dur:.1f}s")
+
+                for fhr, ok in download_results.items():
+                    if ok:
+                        downloaded_hours.add(fhr)
+
+            # Process ONE downloaded hour, then loop back to check for new hours
+            pending = sorted(downloaded_hours - processed_hours)
+            if pending:
+                fhr = pending[0]
+                res = process_forecast_hour_smart(cycle, fhr, output_dirs, categories, fields, force_reprocess, model)
+                if res["success"]:
+                    processed_hours.add(fhr)
+                else:
+                    logger.error(f"F{fhr:02d} failed: {res.get('error')}")
+                consecutive_no_new = 0
+            elif not newly_available:
+                consecutive_no_new += 1
 
             if len(processed_hours) >= len(forecast_hours):
                 break

@@ -84,7 +84,7 @@ class HRRRProcessor:
 
     def process_fields(self, fields_to_process, cycle, forecast_hour, output_dir):
         """Process a list of fields for a given cycle and forecast hour
-        
+
         Args:
             fields_to_process: List of field names to process
             cycle: Model cycle datetime object
@@ -93,19 +93,39 @@ class HRRRProcessor:
         """
         from pathlib import Path
         import logging
-        
+
         logger = logging.getLogger(__name__)
         output_dir = Path(output_dir)
-        
-        # Download GRIB files if needed
+
+        # Determine GRIB directory - check parent if we're in a category subdirectory
+        # GRIB files should be in the F## directory, not category subdirectories
+        grib_dir = output_dir
+        if output_dir.parent.name.startswith('F'):
+            # We're in a category subdirectory like F00/severe/, look for GRIB in F00/
+            grib_dir = output_dir.parent
+
+        # Find or download GRIB files
         grib_files = {}
         for file_type in ["wrfprs", "wrfsfc"]:
             try:
-                grib_file = self.download_model_file(cycle, forecast_hour, output_dir, file_type)
+                # First check if GRIB file already exists in grib_dir
+                grib_pattern = f"*{file_type}*.grib2"
+                existing = list(grib_dir.glob(grib_pattern))
+                if existing:
+                    grib_files[file_type] = existing[0]
+                    continue
+
+                # Skip download if use_local_grib is set
+                if getattr(self, 'use_local_grib', False):
+                    logger.debug(f"use_local_grib set, skipping download for {file_type}")
+                    continue
+
+                # Download to grib_dir (not category subdirectory)
+                grib_file = self.download_model_file(cycle, forecast_hour, grib_dir, file_type)
                 if grib_file and grib_file.exists():
                     grib_files[file_type] = grib_file
             except Exception as e:
-                logger.warning(f"Failed to download {file_type}: {e}")
+                logger.warning(f"Failed to get {file_type}: {e}")
         
         if not grib_files:
             raise RuntimeError("No GRIB files available for processing")
