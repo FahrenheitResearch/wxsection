@@ -129,8 +129,8 @@ def create_interactive_map(
         ).add_to(m)
 
         # Prepare data for JavaScript hover lookup
-        # Use same grid as image for alignment, subsample for file size
-        hover_step = 2
+        # Subsample more aggressively for 2D grids to reduce file size and search time
+        hover_step = 4 if lats_sub.ndim == 2 else 2
         values_js = values_sub[::hover_step, ::hover_step]
 
         if lats_sub.ndim == 1:
