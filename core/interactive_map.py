@@ -12,6 +12,14 @@ import folium
 from folium import plugins
 
 
+def _needs_flip_y(lats_arr: np.ndarray) -> bool:
+    """Check if data rows run south->north (need flip for north-up display)."""
+    if lats_arr.ndim == 1:
+        return lats_arr[0] < lats_arr[-1]  # south->north
+    # For 2D, compare first/last row median
+    return np.nanmedian(lats_arr[0, :]) < np.nanmedian(lats_arr[-1, :])
+
+
 def create_interactive_map(
     data,  # xarray.DataArray
     field_name: str,
@@ -48,9 +56,16 @@ def create_interactive_map(
         if lons.max() > 180:
             lons = np.where(lons > 180, lons - 360, lons)
 
-        # Get data bounds
-        lat_min, lat_max = float(lats.min()), float(lats.max())
-        lon_min, lon_max = float(lons.min()), float(lons.max())
+        # Get data bounds - use corner points for 2D curvilinear grids
+        # (min/max can come from interior points and inflate the box)
+        if lats.ndim == 2:
+            corners_lat = [lats[0, 0], lats[0, -1], lats[-1, 0], lats[-1, -1]]
+            corners_lon = [lons[0, 0], lons[0, -1], lons[-1, 0], lons[-1, -1]]
+            lat_min, lat_max = float(np.nanmin(corners_lat)), float(np.nanmax(corners_lat))
+            lon_min, lon_max = float(np.nanmin(corners_lon)), float(np.nanmax(corners_lon))
+        else:
+            lat_min, lat_max = float(lats.min()), float(lats.max())
+            lon_min, lon_max = float(lons.min()), float(lons.max())
 
         # Calculate center
         center_lat = (lat_min + lat_max) / 2
@@ -73,6 +88,9 @@ def create_interactive_map(
         values_sub = values[::step, ::step]
         lats_sub = lats[::step] if lats.ndim == 1 else lats[::step, ::step]
         lons_sub = lons[::step] if lons.ndim == 1 else lons[::step, ::step]
+
+        # Determine if we need to flip for north-up display
+        flip_y = _needs_flip_y(lats_sub)
 
         # Create color-mapped image
         # Handle custom colormaps - fall back to standard ones
@@ -97,6 +115,10 @@ def create_interactive_map(
         # Convert to uint8 for PNG
         rgba_uint8 = (rgba * 255).astype(np.uint8)
 
+        # Flip image if needed for north-up display
+        if flip_y:
+            rgba_uint8 = np.flipud(rgba_uint8)
+
         # Create base map
         m = folium.Map(
             location=[center_lat, center_lon],
@@ -109,9 +131,7 @@ def create_interactive_map(
         import io
         import base64
 
-        # Flip vertically for correct orientation
-        img_array = np.flipud(rgba_uint8)
-        img = Image.fromarray(img_array, 'RGBA')
+        img = Image.fromarray(rgba_uint8, 'RGBA')
 
         # Save to bytes
         img_bytes = io.BytesIO()
@@ -129,27 +149,37 @@ def create_interactive_map(
         ).add_to(m)
 
         # Prepare data for JavaScript hover lookup
+        # CRITICAL: Apply the same flip to hover data as we did to the image
+        values_for_hover = values_sub
+        lats_for_hover = lats_sub
+        lons_for_hover = lons_sub
+
+        if flip_y:
+            values_for_hover = np.flipud(values_for_hover)
+            if lats_for_hover.ndim == 1:
+                lats_for_hover = lats_for_hover[::-1]
+                # lons 1D does not change for flip-y
+            else:
+                lats_for_hover = np.flipud(lats_for_hover)
+                lons_for_hover = np.flipud(lons_for_hover)
+
         # Use minimal subsampling to keep accuracy
         hover_step = 2
-        values_js = values_sub[::hover_step, ::hover_step]
+        values_js = values_for_hover[::hover_step, ::hover_step]
 
-        if lats_sub.ndim == 1:
-            lats_js = lats_sub[::hover_step]
-            lons_js = lons_sub[::hover_step]
+        if lats_for_hover.ndim == 1:
+            lats_js = lats_for_hover[::hover_step]
+            lons_js = lons_for_hover[::hover_step]
         else:
-            lats_js = lats_sub[::hover_step, ::hover_step]
-            lons_js = lons_sub[::hover_step, ::hover_step]
-
-        # Keep lons in same format as image bounds (-180 to 180)
-        # No conversion needed since lons was already converted above
+            lats_js = lats_for_hover[::hover_step, ::hover_step]
+            lons_js = lons_for_hover[::hover_step, ::hover_step]
 
         # Convert to lists - show actual values (even negative for reflectivity)
         values_list = np.where(np.isnan(values_js), None, np.round(values_js, 1)).tolist()
 
         # Handle 2D curvilinear grids (like HRRR Lambert Conformal)
         if lats_js.ndim == 2:
-            # Flatten to 1D for simpler JS lookup, store grid dimensions
-            grid_shape = lats_js.shape
+            # Flatten to 1D for simpler JS lookup
             lats_flat = lats_js.flatten().tolist()
             lons_flat = lons_js.flatten().tolist()
             values_flat = np.array(values_list).flatten().tolist()
@@ -158,12 +188,14 @@ def create_interactive_map(
             lats_flat = lats_js.tolist()
             lons_flat = lons_js.tolist()
             values_flat = values_list
-            grid_shape = (len(lats_js), len(lons_js))
             is_2d_grid = False
 
         # Get units
         units = field_config.get('units', '')
         title = field_config.get('title', field_name)
+
+        # Get Folium's map variable name for reliable JS access
+        map_var = m.get_name()
 
         # Add custom JavaScript for hover display and opacity control
         if is_2d_grid:
@@ -183,7 +215,7 @@ def create_interactive_map(
                 var lons = weatherData.lons;
                 var values = weatherData.values;
 
-                // Find nearest point in flattened grid (lons are in -180 to 180 format)
+                // Find nearest point in flattened grid
                 var minDist = Infinity;
                 var bestIdx = -1;
                 for (var i = 0; i < lats.length; i++) {{
@@ -202,7 +234,7 @@ def create_interactive_map(
                 return null;
             }}"""
         else:
-            # 1D regular grid
+            # 1D regular grid - use binary search for efficiency
             hover_js = f"""
             <script>
             var weatherData = {{
@@ -213,27 +245,23 @@ def create_interactive_map(
                 title: "{title}"
             }};
 
+            function binarySearchNearest(arr, val) {{
+                var lo = 0, hi = arr.length - 1;
+                while (lo < hi - 1) {{
+                    var mid = (lo + hi) >> 1;
+                    if (arr[mid] < val) lo = mid;
+                    else hi = mid;
+                }}
+                return Math.abs(arr[lo] - val) < Math.abs(arr[hi] - val) ? lo : hi;
+            }}
+
             function findNearestValue(lat, lon) {{
                 var lats = weatherData.lats;
                 var lons = weatherData.lons;
                 var values = weatherData.values;
 
-                var latIdx = 0, lonIdx = 0;
-                var minLatDiff = Math.abs(lats[0] - lat);
-                var minLonDiff = Math.abs(lons[0] - lon);
-
-                for (var i = 1; i < lats.length; i++) {{
-                    if (Math.abs(lats[i] - lat) < minLatDiff) {{
-                        minLatDiff = Math.abs(lats[i] - lat);
-                        latIdx = i;
-                    }}
-                }}
-                for (var i = 1; i < lons.length; i++) {{
-                    if (Math.abs(lons[i] - lon) < minLonDiff) {{
-                        minLonDiff = Math.abs(lons[i] - lon);
-                        lonIdx = i;
-                    }}
-                }}
+                var latIdx = binarySearchNearest(lats, lat);
+                var lonIdx = binarySearchNearest(lons, lon);
 
                 if (latIdx < values.length && lonIdx < values[0].length) {{
                     return values[latIdx][lonIdx];
@@ -261,11 +289,17 @@ def create_interactive_map(
                 '<input type="range" id="opacity-slider" min="0" max="100" value="70" style="width:150px;">';
             document.body.appendChild(sliderDiv);
 
-            // Add mousemove and opacity control
+            // Add mousemove with throttling and opacity control
             setTimeout(function() {{
-                var leafletMap = Object.values(window).find(v => v && v._leaflet_id);
+                var leafletMap = {map_var};
                 if (leafletMap && leafletMap.on) {{
+                    // Throttle mousemove to ~20 FPS for performance
+                    var lastT = 0;
                     leafletMap.on('mousemove', function(e) {{
+                        var now = performance.now();
+                        if (now - lastT < 50) return;
+                        lastT = now;
+
                         var lat = e.latlng.lat;
                         var lon = e.latlng.lng;
                         var val = findNearestValue(lat, lon);
@@ -276,13 +310,12 @@ def create_interactive_map(
                             '<b>Value: ' + valStr + '</b>';
                     }});
 
-                    // Find the image overlay and connect opacity slider
+                    // Connect opacity slider to image overlay
                     var slider = document.getElementById('opacity-slider');
                     var opacityVal = document.getElementById('opacity-val');
                     slider.addEventListener('input', function() {{
                         var opacity = this.value / 100;
                         opacityVal.textContent = this.value + '%';
-                        // Find all image overlays
                         var overlays = document.querySelectorAll('.leaflet-image-layer');
                         overlays.forEach(function(overlay) {{
                             overlay.style.opacity = opacity;
