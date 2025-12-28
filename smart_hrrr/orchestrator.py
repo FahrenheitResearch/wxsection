@@ -121,9 +121,17 @@ def download_gribs_parallel(
 def download_latest_cycle(
     model: str = 'hrrr',
     max_hours: int = 18,
-    max_threads: int = 8
+    max_threads: int = 8,
+    forecast_hours: List[int] = None
 ) -> tuple:
     """Download the latest available model cycle.
+
+    Args:
+        model: Model name (default 'hrrr')
+        max_hours: Maximum forecast hour to download
+        max_threads: Number of parallel download threads
+        forecast_hours: Specific forecast hours to download (e.g., [0, 6, 12, 18]).
+                       If None, downloads all hours from 0 to max_hours.
 
     Returns (date_str, cycle_hour, results_dict) or (None, None, {}) if failed.
     """
@@ -143,19 +151,25 @@ def download_latest_cycle(
     max_fhr = model_config.get_max_forecast_hour(cycle_hour) if model_config else 18
     max_fhr = min(max_fhr, max_hours)
 
-    forecast_hours = list(range(max_fhr + 1))
+    if forecast_hours is not None:
+        # Use specific forecast hours, filtered by what's available
+        fhrs_to_download = [f for f in forecast_hours if f <= max_fhr]
+    else:
+        # Download all hours
+        fhrs_to_download = list(range(max_fhr + 1))
 
-    logger.info(f"Downloading {model.upper()} {date_str} {cycle_hour:02d}Z F00-F{max_fhr:02d}")
+    fhr_str = ','.join(f'F{f:02d}' for f in fhrs_to_download)
+    logger.info(f"Downloading {model.upper()} {date_str} {cycle_hour:02d}Z [{fhr_str}]")
 
     results = download_gribs_parallel(
         model=model,
         date_str=date_str,
         cycle_hour=cycle_hour,
-        forecast_hours=forecast_hours,
+        forecast_hours=fhrs_to_download,
         max_threads=max_threads
     )
 
     success_count = sum(1 for ok in results.values() if ok)
-    logger.info(f"Downloaded {success_count}/{len(forecast_hours)} forecast hours")
+    logger.info(f"Downloaded {success_count}/{len(fhrs_to_download)} forecast hours")
 
     return date_str, cycle_hour, results

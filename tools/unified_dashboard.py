@@ -93,59 +93,201 @@ def rate_limit(f):
 # =============================================================================
 
 class CrossSectionManager:
-    """Manages cross-section data and generation."""
+    """Manages cross-section data from multiple cycles."""
+
+    # Default forecast hours to load (6-hourly for efficiency)
+    FORECAST_HOURS = [0, 6, 12, 18]
 
     def __init__(self):
         self.xsect = None
-        self.data_dir = None
-        self.available_hours = []
-        self.cycle_info = {}
+        self.cycles = {}  # {cycle_key: {'date': str, 'hour': str, 'fhrs': [int]}}
+        self.valid_times = []  # Sorted list of (valid_dt, cycle_key, fhr) tuples
+        self.base_dir = Path("outputs/hrrr")
 
-    def load_run(self, data_dir: str, max_hours: int = 6):
-        """Load HRRR run data for cross-sections."""
+    def find_latest_cycles(self, n_cycles: int = 2):
+        """Find the N most recent available cycles."""
+        from datetime import datetime
+
+        cycles = []
+        if not self.base_dir.exists():
+            return cycles
+
+        # Scan for date directories
+        for date_dir in sorted(self.base_dir.iterdir(), reverse=True):
+            if not date_dir.is_dir() or not date_dir.name.isdigit():
+                continue
+            if len(date_dir.name) != 8:
+                continue
+
+            # Scan for hour directories within date
+            for hour_dir in sorted(date_dir.iterdir(), reverse=True):
+                if not hour_dir.is_dir() or not hour_dir.name.endswith('z'):
+                    continue
+
+                hour = hour_dir.name.replace('z', '')
+                if not hour.isdigit():
+                    continue
+
+                # Check what forecast hours are available
+                available_fhrs = []
+                for fhr in self.FORECAST_HOURS:
+                    fhr_dir = hour_dir / f"F{fhr:02d}"
+                    if fhr_dir.exists() and list(fhr_dir.glob("*wrfprs*.grib2")):
+                        available_fhrs.append(fhr)
+
+                if available_fhrs:
+                    cycles.append({
+                        'date': date_dir.name,
+                        'hour': hour,
+                        'path': str(hour_dir),
+                        'available_fhrs': available_fhrs,
+                    })
+
+                if len(cycles) >= n_cycles:
+                    return cycles
+
+        return cycles
+
+    def load_multi_cycle(self, n_cycles: int = 2, forecast_hours: list = None):
+        """Load data from multiple cycles, only specified forecast hours."""
+        from datetime import datetime, timedelta
         from core.cross_section_interactive import InteractiveCrossSection
 
-        self.data_dir = Path(data_dir).resolve()
-        logger.info(f"Loading data from {self.data_dir}...")
+        fhrs_to_load = forecast_hours or self.FORECAST_HOURS
+        cycles = self.find_latest_cycles(n_cycles)
+
+        if not cycles:
+            logger.error("No HRRR cycles found in outputs/hrrr/")
+            return 0
+
+        logger.info(f"Found {len(cycles)} cycles to load")
+        for c in cycles:
+            logger.info(f"  {c['date']} {c['hour']}Z: F{c['available_fhrs']}")
+
+        # Create cross-section engine
+        self.xsect = InteractiveCrossSection(cache_dir='cache/dashboard/xsect')
+
+        # Load each cycle's data
+        total_loaded = 0
+        self.valid_times = []
+
+        for cycle in cycles:
+            cycle_key = f"{cycle['date']}_{cycle['hour']}z"
+            init_dt = datetime.strptime(f"{cycle['date']}{cycle['hour']}", "%Y%m%d%H")
+
+            # Set metadata for this cycle
+            self.xsect.init_date = cycle['date']
+            self.xsect.init_hour = cycle['hour']
+
+            # Load only the forecast hours we want
+            run_path = Path(cycle['path'])
+            for fhr in fhrs_to_load:
+                if fhr not in cycle['available_fhrs']:
+                    continue
+
+                fhr_dir = run_path / f"F{fhr:02d}"
+                prs_files = list(fhr_dir.glob("*wrfprs*.grib2"))
+                if not prs_files:
+                    continue
+
+                # Load this forecast hour
+                if self.xsect.load_forecast_hour(str(prs_files[0]), fhr):
+                    valid_dt = init_dt + timedelta(hours=fhr)
+                    self.valid_times.append({
+                        'valid_dt': valid_dt,
+                        'valid_str': valid_dt.strftime("%Y-%m-%d %HZ"),
+                        'init_dt': init_dt,
+                        'init_str': init_dt.strftime("%Y-%m-%d %HZ"),
+                        'cycle_key': cycle_key,
+                        'fhr': fhr,
+                    })
+                    total_loaded += 1
+
+            self.cycles[cycle_key] = cycle
+
+        # Sort by valid time
+        self.valid_times.sort(key=lambda x: x['valid_dt'])
+
+        logger.info(f"Loaded {total_loaded} forecast hours across {len(cycles)} cycles")
+        logger.info(f"Valid times: {[v['valid_str'] for v in self.valid_times]}")
+
+        return total_loaded
+
+    def load_run(self, data_dir: str, max_hours: int = 6):
+        """Load HRRR run data for cross-sections (legacy single-cycle mode)."""
+        from core.cross_section_interactive import InteractiveCrossSection
+
+        data_path = Path(data_dir).resolve()
+        logger.info(f"Loading data from {data_path}...")
 
         # Parse cycle info from path
-        parts = str(self.data_dir).split('/')
-        for i, p in enumerate(parts):
-            if p in ['hrrr', 'rrfs']:
-                if i + 2 < len(parts):
-                    self.cycle_info = {
-                        'model': p,
-                        'date': parts[i + 1],
-                        'hour': parts[i + 2].replace('z', ''),
-                    }
-                break
-
-        # Find available forecast hours
-        self.available_hours = sorted([
-            int(d.name[1:]) for d in self.data_dir.iterdir()
-            if d.is_dir() and d.name.startswith('F') and d.name[1:].isdigit()
-        ])
+        import re
+        path_str = str(data_path)
+        date_match = re.search(r'/(\d{8})/(\d{2})z', path_str)
+        if date_match:
+            init_date = date_match.group(1)
+            init_hour = date_match.group(2)
+        else:
+            init_date = None
+            init_hour = None
 
         # Load cross-section engine
         self.xsect = InteractiveCrossSection(cache_dir='cache/dashboard/xsect')
-        loaded = self.xsect.load_run(str(self.data_dir), max_hours=max_hours)
+        loaded = self.xsect.load_run(str(data_path), max_hours=max_hours)
+
+        # Build valid_times list for compatibility
+        from datetime import datetime, timedelta
+        if init_date and init_hour:
+            init_dt = datetime.strptime(f"{init_date}{init_hour}", "%Y%m%d%H")
+            for fhr in self.xsect.get_loaded_hours():
+                valid_dt = init_dt + timedelta(hours=fhr)
+                self.valid_times.append({
+                    'valid_dt': valid_dt,
+                    'valid_str': valid_dt.strftime("%Y-%m-%d %HZ"),
+                    'init_dt': init_dt,
+                    'init_str': init_dt.strftime("%Y-%m-%d %HZ"),
+                    'cycle_key': f"{init_date}_{init_hour}z",
+                    'fhr': fhr,
+                })
+            self.valid_times.sort(key=lambda x: x['valid_dt'])
 
         logger.info(f"Loaded {loaded} hours for cross-sections")
-        logger.info(f"Available hours: {self.available_hours}")
-
         return loaded
 
-    def generate_cross_section(self, start, end, hour, style):
-        """Generate a cross-section image."""
+    def get_available_times(self):
+        """Return list of available valid times for the UI."""
+        return [
+            {
+                'valid': v['valid_str'],
+                'init': v['init_str'],
+                'fhr': v['fhr'],
+                'index': i,
+            }
+            for i, v in enumerate(self.valid_times)
+        ]
+
+    def generate_cross_section(self, start, end, time_index, style):
+        """Generate a cross-section image for a given valid time index."""
         if not self.xsect:
             return None
 
+        # Get the forecast hour and metadata for this valid time
+        if self.valid_times and isinstance(time_index, int) and 0 <= time_index < len(self.valid_times):
+            vt = self.valid_times[time_index]
+            fhr = vt['fhr']
+            # Update xsect metadata to match this cycle
+            cycle_parts = vt['cycle_key'].split('_')
+            self.xsect.init_date = cycle_parts[0]
+            self.xsect.init_hour = cycle_parts[1].replace('z', '')
+        else:
+            # Legacy: treat as direct forecast hour
+            fhr = int(time_index) if time_index else 0
+
         try:
-            # get_cross_section returns PNG bytes directly
             png_bytes = self.xsect.get_cross_section(
                 start_point=start,
                 end_point=end,
-                forecast_hour=hour,
+                forecast_hour=fhr,
                 style=style,
                 return_image=True,
                 dpi=100
@@ -261,7 +403,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div id="map-container">
         <div id="controls">
             <div class="control-group">
-                <label>Hour:</label>
+                <label>Time:</label>
                 <select id="hour-select"></select>
             </div>
             <div class="control-group">
@@ -313,19 +455,41 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         });
 
         // Load initial data
+        let availableTimes = [];
         fetch('/api/info')
             .then(r => r.json())
             .then(data => {
-                availableHours = data.hours || [];
+                availableTimes = data.times || [];
                 const hourSelect = document.getElementById('hour-select');
-                availableHours.forEach(h => {
-                    const opt = document.createElement('option');
-                    opt.value = h;
-                    opt.textContent = 'F' + String(h).padStart(2, '0');
-                    hourSelect.appendChild(opt);
-                });
+                hourSelect.innerHTML = '';
 
-                if (data.cycle) {
+                if (availableTimes.length > 0) {
+                    // New multi-cycle mode: show valid times
+                    availableTimes.forEach((t, idx) => {
+                        const opt = document.createElement('option');
+                        opt.value = idx;  // Use index as value
+                        // Show: "Valid 2025-12-28 18Z (F06 from 12Z)"
+                        const validShort = t.valid.split(' ')[1];  // Just the time part
+                        const initShort = t.init.split(' ')[1];
+                        opt.textContent = `${validShort} (F${String(t.fhr).padStart(2,'0')} ${initShort})`;
+                        hourSelect.appendChild(opt);
+                    });
+                } else {
+                    // Legacy mode: use hours directly
+                    availableHours = data.hours || [];
+                    availableHours.forEach(h => {
+                        const opt = document.createElement('option');
+                        opt.value = h;
+                        opt.textContent = 'F' + String(h).padStart(2, '0');
+                        hourSelect.appendChild(opt);
+                    });
+                }
+
+                // Show cycle info
+                if (data.cycles && data.cycles.length > 0) {
+                    document.getElementById('cycle-info').textContent =
+                        `Cycles: ${data.cycles.join(', ')}`;
+                } else if (data.cycle) {
                     document.getElementById('cycle-info').textContent =
                         `${data.cycle.model.toUpperCase()} ${data.cycle.date} ${data.cycle.hour}Z`;
                 }
@@ -383,11 +547,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
             const start = startMarker.getLatLng();
             const end = endMarker.getLatLng();
-            const hour = document.getElementById('hour-select').value;
+            const timeIndex = document.getElementById('hour-select').value;
             const style = document.getElementById('style-select').value;
 
             const url = `/api/xsect?start_lat=${start.lat}&start_lon=${start.lng}` +
-                `&end_lat=${end.lat}&end_lon=${end.lng}&hour=${hour}&style=${style}`;
+                `&end_lat=${end.lat}&end_lon=${end.lng}&time_index=${timeIndex}&style=${style}`;
 
             fetch(url)
                 .then(r => {
@@ -432,9 +596,12 @@ def index():
 
 @app.route('/api/info')
 def api_info():
+    # Return valid times for the slider
+    times = data_manager.get_available_times()
     return jsonify({
-        'hours': data_manager.available_hours,
-        'cycle': data_manager.cycle_info,
+        'times': times,  # New: list of {valid, init, fhr, index}
+        'hours': [t['fhr'] for t in times],  # Legacy compatibility
+        'cycles': list(data_manager.cycles.keys()),
         'styles': XSECT_STYLES,
     })
 
@@ -444,12 +611,14 @@ def api_xsect():
     try:
         start = (float(request.args['start_lat']), float(request.args['start_lon']))
         end = (float(request.args['end_lat']), float(request.args['end_lon']))
-        hour = int(request.args.get('hour', 0))
+        # Support both time_index (new) and hour (legacy)
+        time_index = request.args.get('time_index', request.args.get('hour', 0))
+        time_index = int(time_index)
         style = request.args.get('style', 'wind_speed')
     except (KeyError, ValueError) as e:
         return jsonify({'error': f'Invalid parameters: {e}'}), 400
 
-    buf = data_manager.generate_cross_section(start, end, hour, style)
+    buf = data_manager.generate_cross_section(start, end, time_index, style)
     if buf is None:
         return jsonify({'error': 'Failed to generate cross-section'}), 500
 
@@ -461,9 +630,12 @@ def api_xsect():
 
 def main():
     parser = argparse.ArgumentParser(description='HRRR Cross-Section Dashboard')
-    parser.add_argument('--data-dir', type=str, help='Path to HRRR run data')
+    parser.add_argument('--data-dir', type=str, help='Path to HRRR run data (single cycle)')
     parser.add_argument('--auto-update', action='store_true', help='Auto-download latest')
-    parser.add_argument('--max-hours', type=int, default=6, help='Hours to load for xsect')
+    parser.add_argument('--multi-cycle', action='store_true',
+                       help='Load F00,F06,F12,F18 from latest 2 cycles (default mode)')
+    parser.add_argument('--n-cycles', type=int, default=2, help='Number of cycles to load')
+    parser.add_argument('--max-hours', type=int, default=18, help='Max forecast hour to load')
     parser.add_argument('--port', type=int, default=5000, help='Server port')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Server host')
     parser.add_argument('--production', action='store_true', help='Enable rate limiting')
@@ -471,22 +643,41 @@ def main():
     args = parser.parse_args()
     app.config['PRODUCTION'] = args.production
 
+    # Determine loading mode
     if args.auto_update:
+        # Download latest data, then use multi-cycle loading
         from smart_hrrr.orchestrator import download_latest_cycle
-        from smart_hrrr.io import create_output_structure
 
-        date_str, hour, results = download_latest_cycle(max_hours=args.max_hours)
-        if date_str:
-            output_dirs = create_output_structure('hrrr', date_str, hour)
-            args.data_dir = str(output_dirs['run'])
-        else:
+        logger.info("Downloading latest HRRR data...")
+        # Download F00, F06, F12, F18 only
+        fhrs_to_download = [0, 6, 12, 18]
+        fhrs_to_download = [f for f in fhrs_to_download if f <= args.max_hours]
+
+        date_str, hour, results = download_latest_cycle(
+            max_hours=max(fhrs_to_download),
+            forecast_hours=fhrs_to_download
+        )
+        if not date_str:
             logger.error("Failed to download data")
             sys.exit(1)
 
-    if not args.data_dir:
-        parser.error("Must specify --data-dir or --auto-update")
+        # Now load with multi-cycle mode
+        args.multi_cycle = True
 
-    data_manager.load_run(args.data_dir, max_hours=args.max_hours)
+    if args.multi_cycle or not args.data_dir:
+        # Multi-cycle mode: load F00,F06,F12,F18 from latest N cycles
+        logger.info(f"Loading {args.n_cycles} cycles (F00, F06, F12, F18 each)...")
+        fhrs = [f for f in [0, 6, 12, 18] if f <= args.max_hours]
+        loaded = data_manager.load_multi_cycle(
+            n_cycles=args.n_cycles,
+            forecast_hours=fhrs
+        )
+        if loaded == 0:
+            logger.error("No data loaded. Run with --auto-update to download.")
+            sys.exit(1)
+    else:
+        # Single cycle mode (legacy)
+        data_manager.load_run(args.data_dir, max_hours=args.max_hours)
 
     logger.info("=" * 60)
     logger.info("HRRR Cross-Section Dashboard")
