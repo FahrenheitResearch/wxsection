@@ -1,26 +1,30 @@
 # Cross-Section Dashboard Context
 
-## Current State (Dec 27, 2025)
+## Current State (Dec 30, 2025)
 
 ### Branch: `focused/cross-section-dashboard`
 
-Stripped-down repo focused on interactive cross-sections only.
+Focused repo for interactive HRRR cross-section visualization.
 
 ### What Works
-- Dashboard at `tools/unified_dashboard.py` (475 lines)
-- Cross-section generation via `core/cross_section_interactive.py`
-- NPZ caching in `cache/dashboard/xsect/` (~3s per hour from cache)
-- 7 styles: wind_speed, temp, theta_e, rh, omega, vorticity, cloud
-- GRIB downloads via `smart_hrrr/orchestrator.py`
+- **Dashboard**: `tools/unified_dashboard.py` - Flask + Leaflet interactive map
+- **Cross-section engine**: `core/cross_section_interactive.py` - Sub-second generation
+- **NPZ caching**: `cache/dashboard/xsect/` (~2s per hour from cache vs 25s from GRIB)
+- **14 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis
+- **Split & Chip UI**: Model Run dropdown + Forecast Hour chips (F00, F06, F12, F18)
+- **Smart preloading**: Prefers complete cycles (all 4 FHRs available)
+- **GRIB downloads**: `smart_hrrr/orchestrator.py` with parallel threading
 
 ### Files (14 Python files)
 ```
 config/colormaps.py
-core/cross_section_interactive.py  # Main engine - get_cross_section()
-core/cross_section_production.py
+core/__init__.py
+core/cross_section_interactive.py   # Main engine - get_cross_section()
+core/cross_section_production.py    # Batch generation
 core/downloader.py
 core/grib_loader.py
 model_config.py
+smart_hrrr/__init__.py
 smart_hrrr/availability.py
 smart_hrrr/io.py
 smart_hrrr/orchestrator.py
@@ -29,25 +33,32 @@ tools/auto_update.py
 tools/unified_dashboard.py
 ```
 
+### Key Features
+- **Frontogenesis**: Petterssen kinematic formula with Gaussian smoothing ("Winter Bander" mode)
+- **Wind barbs**: Rotated to cross-section orientation
+- **Terrain masking**: Below surface pressure
+- **Metadata labels**: Init time, valid time, path distance
+- **Memory management**: ~1.7 GB per forecast hour, max 2 cycles loaded
+
 ### Key APIs
-- `InteractiveCrossSection.get_cross_section(start_point, end_point, style, forecast_hour)` returns PNG bytes
-- `download_gribs_parallel(model, date_str, cycle_hour, forecast_hours)` downloads GRIBs
+```python
+# Interactive cross-section
+from core.cross_section_interactive import InteractiveCrossSection
+ixs = InteractiveCrossSection(cache_dir="cache/dashboard/xsect")
+ixs.load_forecast_hour(data_dir, forecast_hour)
+img_bytes = ixs.get_cross_section(start_point, end_point, style, forecast_hour)
 
-### TODO
-1. ~~Fix UI - make cross-section bigger, map smaller~~ DONE - sidebar now 55% width
-2. ~~Add draggable markers~~ DONE - markers are now draggable, line updates on drag
-3. Test and refine as needed
+# Parallel downloads
+from smart_hrrr.orchestrator import download_gribs_parallel
+download_gribs_parallel(model, date_str, cycle_hour, forecast_hours)
+```
 
-### Previous Branches
-- `experimental/unified-dashboard` - full dashboard with map overlays
-- `feature/interactive-maps` - earlier work
-- `master` - main branch
+### Running Dashboard
+```bash
+python tools/unified_dashboard.py --auto-update --port 5559
+python tools/unified_dashboard.py --auto-update --port 5559 --production  # with rate limiting
+```
 
 ### Data Location
 - GRIB files: `outputs/hrrr/YYYYMMDD/HHz/F##/`
 - NPZ cache: `cache/dashboard/xsect/`
-
-### Running Dashboard
-```bash
-python tools/unified_dashboard.py --data-dir outputs/hrrr/20251227/09z --port 5559 --max-hours 4
-```

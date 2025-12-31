@@ -10,6 +10,7 @@ build/
 # Outputs and data
 outputs/
 cache/
+grib_files/
 *.grib2
 *.idx
 *.nc
