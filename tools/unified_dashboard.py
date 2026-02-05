@@ -350,8 +350,8 @@ class CrossSectionManager:
     """
 
     FORECAST_HOURS = list(range(19))  # F00-F18
-    PRELOAD_FHRS = [0, 3, 6, 9, 12, 15, 18]  # Every 3rd hour for preloading
-    PRELOAD_WORKERS = 2  # Parallel workers for loading FHRs (keep low to avoid memory/IO pressure)
+    PRELOAD_FHRS = list(range(19))  # All FHRs (F00-F18) — mmap cache makes this cheap (~29MB heap each)
+    PRELOAD_WORKERS = 2  # Parallel workers for loading FHRs
     PRELOAD_CYCLES = 0  # Don't pre-load; load on demand
     MEM_LIMIT_MB = 117000  # 117 GB hard cap
     MEM_EVICT_MB = 115000  # Start evicting at 115 GB
@@ -589,11 +589,9 @@ class CrossSectionManager:
         if not self.xsect or not self.available_cycles:
             return
 
-        protected = self.get_protected_cycles()
+        # Auto-load all available cycles on disk (mmap makes this cheap)
         for cycle in self.available_cycles:
             cycle_key = cycle['cycle_key']
-            if cycle_key not in protected:
-                continue
 
             run_path = Path(cycle['path'])
             with self._lock:
@@ -3314,7 +3312,7 @@ def api_favorite_delete(fav_id):
 def main():
     parser = argparse.ArgumentParser(description='HRRR Cross-Section Dashboard')
     parser.add_argument('--auto-update', action='store_true', help='Download latest data before starting')
-    parser.add_argument('--preload', type=int, default=2, help='Number of latest cycles to pre-load')
+    parser.add_argument('--preload', type=int, default=24, help='Number of latest cycles to pre-load (mmap makes all cheap)')
     parser.add_argument('--max-hours', type=int, default=18, help='Max forecast hour to download')
     parser.add_argument('--port', type=int, default=5000, help='Server port')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Server host')
