@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import io
@@ -21,8 +22,10 @@ from pathlib import Path
 from datetime import datetime
 from functools import wraps
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import imageio.v2 as imageio
+from PIL import Image
 
 from flask import Flask, jsonify, request, send_file, abort
 
@@ -263,6 +266,17 @@ class RateLimiter:
 
 rate_limiter = RateLimiter()
 
+# Limit concurrent matplotlib renders to prevent CPU/memory thrash under load
+RENDER_SEMAPHORE = threading.Semaphore(4)
+
+# Admin key for archive access — set via WXSECTION_KEY env var
+ADMIN_KEY = os.environ.get('WXSECTION_KEY', '')
+
+def check_admin_key():
+    """Check if request has valid admin key (query param or header)."""
+    key = request.args.get('key', '') or request.headers.get('X-Admin-Key', '')
+    return bool(ADMIN_KEY) and key == ADMIN_KEY
+
 def rate_limit(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -329,6 +343,8 @@ class CrossSectionManager:
     """
 
     FORECAST_HOURS = list(range(19))  # F00-F18
+    PRELOAD_FHRS = [0, 3, 6, 9, 12, 15, 18]  # Every 3rd hour for preloading
+    PRELOAD_WORKERS = 4  # Parallel workers for loading FHRs
     PRELOAD_CYCLES = 0  # Don't pre-load; load on demand
     MEM_LIMIT_MB = 117000  # 117 GB hard cap
     MEM_EVICT_MB = 115000  # Start evicting at 115 GB
@@ -344,6 +360,18 @@ class CrossSectionManager:
         self._engine_key_map = {}  # (cycle_key, fhr) -> unique engine int key
         self._next_engine_key = 0  # Counter for unique keys
 
+    def get_protected_cycles(self) -> set:
+        """Return the 2 newest cycle keys — these never get evicted or unloaded."""
+        if len(self.available_cycles) >= 2:
+            return {self.available_cycles[0]['cycle_key'], self.available_cycles[1]['cycle_key']}
+        elif self.available_cycles:
+            return {self.available_cycles[0]['cycle_key']}
+        return set()
+
+    def is_archive_cycle(self, cycle_key: str) -> bool:
+        """Return True if cycle_key is NOT one of the 2 latest (i.e. it's archive/old)."""
+        return cycle_key not in self.get_protected_cycles()
+
     def _get_engine_key(self, cycle_key: str, fhr: int) -> int:
         """Get or create a unique engine key for a (cycle_key, fhr) pair."""
         pair = (cycle_key, fhr)
@@ -353,17 +381,24 @@ class CrossSectionManager:
         return self._engine_key_map[pair]
 
     def _evict_if_needed(self):
-        """Evict oldest loaded items if memory exceeds threshold."""
+        """Evict oldest loaded items if memory exceeds threshold. Protected cycles are skipped."""
         if not self.xsect:
             return
+        protected = self.get_protected_cycles()
         mem_mb = self.xsect.get_memory_usage()
         while mem_mb > self.MEM_EVICT_MB and self.loaded_items:
-            # Evict oldest (first in list)
-            old_key, old_fhr = self.loaded_items[0]
+            # Find oldest non-protected item to evict
+            evict_idx = None
+            for i, (ck, fhr) in enumerate(self.loaded_items):
+                if ck not in protected:
+                    evict_idx = i
+                    break
+            if evict_idx is None:
+                logger.warning(f"Memory {mem_mb:.0f}MB > limit but only protected cycles loaded, cannot evict")
+                break
+            old_key, old_fhr = self.loaded_items.pop(evict_idx)
             logger.info(f"Memory {mem_mb:.0f}MB > {self.MEM_EVICT_MB}MB, evicting {old_key} F{old_fhr:02d}")
             self._unload_item(old_key, old_fhr)
-            self.loaded_items.pop(0)
-            # If all FHRs of a cycle are evicted, unmark it
             if not any(k == old_key for k, _ in self.loaded_items):
                 self.loaded_cycles.discard(old_key)
             mem_mb = self.xsect.get_memory_usage()
@@ -438,51 +473,113 @@ class CrossSectionManager:
         ]
 
     def preload_latest_cycles(self, n_cycles: int = None):
-        """Pre-load the latest N cycles that have all 4 forecast hours."""
+        """Pre-load the latest N cycles with every 3rd forecast hour, newest first, parallel."""
         if n_cycles is None:
             n_cycles = self.PRELOAD_CYCLES
 
         self.init_engine()
 
-        # Prefer cycles with all 4 FHRs (F00, F06, F12, F18)
-        complete_cycles = [c for c in self.available_cycles
-                          if all(fhr in c['available_fhrs'] for fhr in self.FORECAST_HOURS)]
-
-        if len(complete_cycles) >= n_cycles:
-            cycles_to_load = complete_cycles[:n_cycles]
-            logger.info(f"Found {len(complete_cycles)} complete cycles (all 4 FHRs)")
-        else:
-            # Fall back to newest cycles if not enough complete ones
-            cycles_to_load = self.available_cycles[:n_cycles]
-            logger.info(f"Only {len(complete_cycles)} complete cycles, using newest {n_cycles}")
+        # Newest cycles first (available_cycles already sorted newest-first)
+        cycles_to_load = self.available_cycles[:n_cycles]
 
         for cycle in cycles_to_load:
             cycle_key = cycle['cycle_key']
-            logger.info(f"Pre-loading {cycle['display']} (even FHRs only)...")
+            run_path = Path(cycle['path'])
 
-            for fhr in cycle['available_fhrs']:
-                if fhr % 2 != 0:
-                    continue  # Only preload even forecast hours into RAM
+            # Only preload every-3rd FHRs that are available on disk
+            with self._lock:
+                fhrs_to_load = [fhr for fhr in cycle['available_fhrs']
+                                if fhr in self.PRELOAD_FHRS
+                                and (cycle_key, fhr) not in self.loaded_items]
+
+            if not fhrs_to_load:
+                continue
+
+            def _load_one(fhr):
                 with self._lock:
                     if (cycle_key, fhr) in self.loaded_items:
-                        continue
+                        return fhr, True
                     self.xsect.init_date = cycle['date']
                     self.xsect.init_hour = cycle['hour']
+                    self._evict_if_needed()
                     engine_key = self._get_engine_key(cycle_key, fhr)
 
-                run_path = Path(cycle['path'])
-                fhr_dir = run_path / f"F{fhr:02d}"
-                prs_files = list(fhr_dir.glob("*wrfprs*.grib2"))
+                prs_files = list((run_path / f"F{fhr:02d}").glob("*wrfprs*.grib2"))
+                if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
+                    with self._lock:
+                        self.loaded_items.append((cycle_key, fhr))
+                    return fhr, True
+                return fhr, False
 
-                if prs_files:
-                    if self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
-                        with self._lock:
-                            self.loaded_items.append((cycle_key, fhr))
+            fhr_list = ', '.join(f'F{f:02d}' for f in fhrs_to_load)
+            logger.info(f"Pre-loading {cycle['display']} [{fhr_list}] ({self.PRELOAD_WORKERS} workers)...")
+
+            with ThreadPoolExecutor(max_workers=self.PRELOAD_WORKERS) as pool:
+                futures = {pool.submit(_load_one, fhr): fhr for fhr in fhrs_to_load}
+                for future in as_completed(futures):
+                    try:
+                        fhr, ok = future.result()
+                        if ok:
+                            logger.info(f"  Loaded {cycle_key} F{fhr:02d}")
+                    except Exception as e:
+                        logger.warning(f"  Failed to load FHR: {e}")
 
             with self._lock:
                 self.loaded_cycles.add(cycle_key)
             mem_mb = self.xsect.get_memory_usage()
-            logger.info(f"  {cycle['display']} loaded ({mem_mb:.0f} MB total)")
+            logger.info(f"  {cycle['display']} done ({mem_mb:.0f} MB total)")
+
+    def auto_load_latest(self):
+        """Check latest 2 cycles for new PRELOAD_FHRS on disk and load them into RAM."""
+        if not self.xsect or not self.available_cycles:
+            return
+
+        protected = self.get_protected_cycles()
+        for cycle in self.available_cycles:
+            cycle_key = cycle['cycle_key']
+            if cycle_key not in protected:
+                continue
+
+            run_path = Path(cycle['path'])
+            with self._lock:
+                fhrs_to_load = [fhr for fhr in cycle['available_fhrs']
+                                if fhr in self.PRELOAD_FHRS
+                                and (cycle_key, fhr) not in self.loaded_items]
+
+            if not fhrs_to_load:
+                continue
+
+            def _load_one(fhr):
+                with self._lock:
+                    if (cycle_key, fhr) in self.loaded_items:
+                        return fhr, True
+                    self.xsect.init_date = cycle['date']
+                    self.xsect.init_hour = cycle['hour']
+                    self._evict_if_needed()
+                    engine_key = self._get_engine_key(cycle_key, fhr)
+
+                prs_files = list((run_path / f"F{fhr:02d}").glob("*wrfprs*.grib2"))
+                if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
+                    with self._lock:
+                        self.loaded_items.append((cycle_key, fhr))
+                    return fhr, True
+                return fhr, False
+
+            fhr_list = ', '.join(f'F{f:02d}' for f in fhrs_to_load)
+            logger.info(f"Auto-loading new FHRs for {cycle['display']} [{fhr_list}]...")
+
+            with ThreadPoolExecutor(max_workers=self.PRELOAD_WORKERS) as pool:
+                futures = {pool.submit(_load_one, fhr): fhr for fhr in fhrs_to_load}
+                for future in as_completed(futures):
+                    try:
+                        fhr, ok = future.result()
+                        if ok:
+                            logger.info(f"  Auto-loaded {cycle_key} F{fhr:02d}")
+                    except Exception as e:
+                        logger.warning(f"  Auto-load failed: {e}")
+
+            with self._lock:
+                self.loaded_cycles.add(cycle_key)
 
     def get_loaded_status(self):
         """Return current memory status."""
@@ -495,7 +592,7 @@ class CrossSectionManager:
         }
 
     def load_cycle(self, cycle_key: str) -> dict:
-        """Load an entire cycle (all available FHRs) into memory."""
+        """Load an entire cycle (all available FHRs) into memory, parallel."""
         with self._lock:
             if cycle_key in self.loaded_cycles:
                 return {'success': True, 'already_loaded': True}
@@ -506,42 +603,55 @@ class CrossSectionManager:
 
             self.init_engine()
 
+        run_path = Path(cycle['path'])
         op_id = f"cycle:{cycle_key}"
         total_fhrs = len(cycle['available_fhrs'])
         progress_update(op_id, 0, total_fhrs, "Starting...", label=f"Loading cycle {cycle_key}")
-        loaded_count = 0
+        loaded_count = [0]  # mutable for closure
 
-        for idx, fhr in enumerate(cycle['available_fhrs']):
+        # Count already-loaded
+        with self._lock:
+            fhrs_to_load = []
+            for fhr in cycle['available_fhrs']:
+                if (cycle_key, fhr) in self.loaded_items:
+                    loaded_count[0] += 1
+                else:
+                    fhrs_to_load.append(fhr)
+
+        def _load_one(fhr):
             with self._lock:
                 if (cycle_key, fhr) in self.loaded_items:
-                    loaded_count += 1
-                    progress_update(op_id, loaded_count, total_fhrs, f"F{fhr:02d} (cached)")
-                    continue
+                    return fhr, True
+                self.xsect.init_date = cycle['date']
+                self.xsect.init_hour = cycle['hour']
+                self._evict_if_needed()
+                engine_key = self._get_engine_key(cycle_key, fhr)
 
-            run_path = Path(cycle['path'])
-            fhr_dir = run_path / f"F{fhr:02d}"
-            prs_files = list(fhr_dir.glob("*wrfprs*.grib2"))
-
-            if prs_files:
+            prs_files = list((run_path / f"F{fhr:02d}").glob("*wrfprs*.grib2"))
+            if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
                 with self._lock:
-                    self.xsect.init_date = cycle['date']
-                    self.xsect.init_hour = cycle['hour']
-                    self._evict_if_needed()
-                    engine_key = self._get_engine_key(cycle_key, fhr)
+                    self.loaded_items.append((cycle_key, fhr))
+                return fhr, True
+            return fhr, False
 
-                progress_update(op_id, loaded_count, total_fhrs, f"Loading F{fhr:02d}...")
-                logger.info(f"Loading {cycle_key} F{fhr:02d} (engine key {engine_key})...")
+        logger.info(f"Loading {cycle['display']} ({len(fhrs_to_load)} FHRs, {self.PRELOAD_WORKERS} workers)...")
 
-                # Slow I/O without lock
-                if self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
-                    with self._lock:
-                        self.loaded_items.append((cycle_key, fhr))
-                    loaded_count += 1
+        with ThreadPoolExecutor(max_workers=self.PRELOAD_WORKERS) as pool:
+            futures = {pool.submit(_load_one, fhr): fhr for fhr in fhrs_to_load}
+            for future in as_completed(futures):
+                try:
+                    fhr, ok = future.result()
+                    if ok:
+                        loaded_count[0] += 1
+                        progress_update(op_id, loaded_count[0], total_fhrs, f"Loaded F{fhr:02d}")
+                        logger.info(f"  Loaded {cycle_key} F{fhr:02d}")
+                except Exception as e:
+                    logger.warning(f"  Failed to load FHR: {e}")
 
         with self._lock:
             self.loaded_cycles.add(cycle_key)
         mem_mb = self.xsect.get_memory_usage()
-        logger.info(f"Loaded {cycle['display']} ({loaded_count} FHRs, {mem_mb:.0f} MB total)")
+        logger.info(f"Loaded {cycle['display']} ({loaded_count[0]} FHRs, {mem_mb:.0f} MB total)")
         progress_done(op_id)
 
         return {
@@ -617,11 +727,14 @@ class CrossSectionManager:
             self.xsect.unload_hour(engine_key)
             logger.info(f"Unloaded {cycle_key} F{fhr:02d}")
 
-    def unload_forecast_hour(self, cycle_key: str, fhr: int) -> dict:
-        """Explicitly unload a forecast hour."""
+    def unload_forecast_hour(self, cycle_key: str, fhr: int, is_admin: bool = False) -> dict:
+        """Explicitly unload a forecast hour. Protected cycles require admin."""
         with self._lock:
             if (cycle_key, fhr) not in self.loaded_items:
                 return {'success': True, 'not_loaded': True}
+
+            if not is_admin and cycle_key in self.get_protected_cycles():
+                return {'success': False, 'error': 'Cannot unload latest cycles'}
 
             self._unload_item(cycle_key, fhr)
             self.loaded_items.remove((cycle_key, fhr))
@@ -641,19 +754,20 @@ class CrossSectionManager:
         if (cycle_key, fhr) not in self.loaded_items:
             return None
 
-        # Set correct metadata for this cycle
         cycle = next((c for c in self.available_cycles if c['cycle_key'] == cycle_key), None)
-        if cycle:
-            self.xsect.init_date = cycle['date']
-            self.xsect.init_hour = cycle['hour']
-
         engine_key = self._engine_key_map.get((cycle_key, fhr))
         if engine_key is None:
             return None
 
+        # Build metadata with real FHR (not engine key) — thread-safe, no shared state
+        meta = {
+            'model': 'HRRR',
+            'init_date': cycle['date'] if cycle else None,
+            'init_hour': cycle['hour'] if cycle else None,
+            'forecast_hour': fhr,
+        }
+
         try:
-            # Pass real forecast hour for correct title labeling
-            self.xsect._real_forecast_hour = fhr
             png_bytes = self.xsect.get_cross_section(
                 start_point=start,
                 end_point=end,
@@ -666,7 +780,8 @@ class CrossSectionManager:
                 y_top=y_top,
                 units=units,
                 terrain_data=terrain_data,
-                temp_cmap=temp_cmap
+                temp_cmap=temp_cmap,
+                metadata=meta,
             )
             if png_bytes is None:
                 return None
@@ -1367,7 +1482,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <option value="nws_ndfd">NWS Classic</option>
                     </select>
                     <button class="help-btn" id="help-btn" title="Style explanations & feedback">?</button>
-                    <button class="request-btn" id="request-btn" title="Submit feature request">💡</button>
                 </div>
                 <div class="control-group">
                     <label>Y-Axis:</label>
@@ -1411,10 +1525,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <button id="swap-btn" title="Swap start/end points">⇄ Swap</button>
                 <button id="gif-btn" title="Generate animated GIF of all loaded FHRs">GIF</button>
                 <select id="gif-speed" title="GIF speed">
-                    <option value="normal">Normal</option>
-                    <option value="slow">Slow</option>
+                    <option value="1">1x</option>
+                    <option value="0.75">0.75x</option>
+                    <option value="0.5" selected>0.5x</option>
+                    <option value="0.25">0.25x</option>
                 </select>
                 <button id="clear-btn">Clear Line</button>
+                <button id="admin-key-btn" title="Enter admin key for archive access" style="padding:4px 8px;font-size:13px;">🔒</button>
                 <div id="memory-status">
                     <span id="mem-text">0 MB</span>
                     <div class="mem-bar"><div class="mem-fill" id="mem-fill" style="width:0%"></div></div>
@@ -1496,6 +1613,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let currentCycle = null;   // Currently selected cycle key
         let selectedFhrs = [];     // Currently selected/loaded forecast hours
         let activeFhr = null;      // Which FHR is currently displayed in cross-section
+        let isAdmin = false;
+        let protectedCycles = [];
+
+        // Admin key management
+        function getAdminKey() { return localStorage.getItem('wxsection_admin_key') || ''; }
+        function adminParam() { const k = getAdminKey(); return k ? `&key=${encodeURIComponent(k)}` : ''; }
+        async function checkAdminKey() {
+            const k = getAdminKey();
+            if (!k) { setAdminState(false, []); return; }
+            try {
+                const res = await fetch(`/api/check_key?key=${encodeURIComponent(k)}`);
+                const data = await res.json();
+                setAdminState(data.valid, data.protected || []);
+            } catch { setAdminState(false, []); }
+        }
+        function setAdminState(valid, prot) {
+            isAdmin = valid;
+            protectedCycles = prot;
+            const btn = document.getElementById('admin-key-btn');
+            btn.textContent = valid ? '🔓' : '🔒';
+            btn.title = valid ? 'Admin mode active (click to change key)' : 'Enter admin key for archive access';
+        }
+        document.getElementById('admin-key-btn').onclick = async function() {
+            const key = prompt(isAdmin ? 'Admin key (current key active, clear to revoke):' : 'Enter admin key:', getAdminKey());
+            if (key === null) return;
+            if (key === '') { localStorage.removeItem('wxsection_admin_key'); setAdminState(false, []); showToast('Key removed', 'success', 2000); return; }
+            localStorage.setItem('wxsection_admin_key', key);
+            await checkAdminKey();
+            showToast(isAdmin ? 'Admin access granted' : 'Invalid key', isAdmin ? 'success' : 'error', 2000);
+        };
+        checkAdminKey();
 
         // Initialize map
         const map = L.map('map', {
@@ -1736,7 +1884,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
             const toast = showToast(`Requesting ${dateStr}/${String(hour).padStart(2,'0')}z F00-F18...`);
             try {
-                const res = await fetch(`/api/request_cycle?date=${dateStr}&hour=${hour}`, {method: 'POST'});
+                const res = await fetch(`/api/request_cycle?date=${dateStr}&hour=${hour}${adminParam()}`, {method: 'POST'});
                 const data = await res.json();
                 toast.remove();
                 if (data.success) {
@@ -1953,7 +2101,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 // Need to load this cycle first
                 const toast = showToast(`Loading cycle (this may take a minute)...`);
                 try {
-                    const res = await fetch(`/api/load_cycle?cycle=${currentCycle}`, {method: 'POST'});
+                    const res = await fetch(`/api/load_cycle?cycle=${currentCycle}${adminParam()}`, {method: 'POST'});
                     const data = await res.json();
                     toast.remove();
 
@@ -2054,7 +2202,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const toast = showToast(`Unloading F${String(fhr).padStart(2,'0')}...`);
 
                 try {
-                    const res = await fetch(`/api/unload?cycle=${currentCycle}&fhr=${fhr}`, {method: 'POST'});
+                    const res = await fetch(`/api/unload?cycle=${currentCycle}&fhr=${fhr}${adminParam()}`, {method: 'POST'});
                     const data = await res.json();
 
                     if (data.success) {
@@ -2102,7 +2250,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
             try {
                 const loadStart = Date.now();
-                const res = await fetch(`/api/load?cycle=${currentCycle}&fhr=${fhr}`, {method: 'POST'});
+                const res = await fetch(`/api/load?cycle=${currentCycle}&fhr=${fhr}${adminParam()}`, {method: 'POST'});
                 const data = await res.json();
                 const loadSec = ((Date.now() - loadStart) / 1000).toFixed(1);
 
@@ -2515,54 +2663,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             return div.innerHTML;
         }
 
-        document.getElementById('request-btn').onclick = async () => {
-            await loadRequests();
-            renderRequests();
-            document.getElementById('request-modal').classList.add('visible');
-        };
-
-        document.getElementById('request-modal-close').onclick = () => {
-            document.getElementById('request-modal').classList.remove('visible');
-        };
-
-        document.getElementById('request-modal').onclick = (e) => {
-            if (e.target.id === 'request-modal') {
-                document.getElementById('request-modal').classList.remove('visible');
-            }
-        };
-
-        document.getElementById('request-form').onsubmit = async (e) => {
-            e.preventDefault();
-            const name = document.getElementById('request-name').value.trim();
-            const text = document.getElementById('request-text').value.trim();
-
-            if (!text) return;
-
-            const btn = e.target.querySelector('.submit-btn');
-            btn.disabled = true;
-            btn.textContent = 'Submitting...';
-
-            try {
-                const res = await fetch('/api/request', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name, text})
-                });
-                if (res.ok) {
-                    showToast('Request submitted! Thank you!', 'success');
-                    document.getElementById('request-text').value = '';
-                    await loadRequests();
-                    renderRequests();
-                } else {
-                    showToast('Failed to submit request', 'error');
-                }
-            } catch (err) {
-                showToast('Failed to submit request', 'error');
-            }
-
-            btn.disabled = false;
-            btn.textContent = 'Submit Request';
-        };
+        // Feedback UI removed — check data/requests.json directly
 
         // =========================================================================
         // Initialize
@@ -2644,6 +2745,11 @@ def api_cycles():
         'cycles': data_manager.get_cycles_for_ui(),
     })
 
+@app.route('/api/check_key')
+def api_check_key():
+    """Check if the provided admin key is valid."""
+    return jsonify({'valid': check_admin_key(), 'protected': list(data_manager.get_protected_cycles())})
+
 @app.route('/api/status')
 def api_status():
     """Return current memory/loading status."""
@@ -2670,7 +2776,7 @@ def api_progress():
 @app.route('/api/load', methods=['POST'])
 @rate_limit
 def api_load():
-    """Load a forecast hour into memory."""
+    """Load a forecast hour into memory. Archive cycles require admin key."""
     cycle_key = request.args.get('cycle')
     fhr = request.args.get('fhr')
 
@@ -2682,17 +2788,23 @@ def api_load():
     except ValueError:
         return jsonify({'success': False, 'error': 'Invalid fhr'}), 400
 
+    if data_manager.is_archive_cycle(cycle_key) and not check_admin_key():
+        return jsonify({'success': False, 'error': 'Admin key required to load archive data'}), 403
+
     result = data_manager.load_forecast_hour(cycle_key, fhr)
     return jsonify(result)
 
 @app.route('/api/load_cycle', methods=['POST'])
 @rate_limit
 def api_load_cycle():
-    """Load an entire cycle (all FHRs) into memory."""
+    """Load an entire cycle (all FHRs) into memory. Archive cycles require admin key."""
     cycle_key = request.args.get('cycle')
 
     if not cycle_key:
         return jsonify({'success': False, 'error': 'Missing cycle parameter'}), 400
+
+    if data_manager.is_archive_cycle(cycle_key) and not check_admin_key():
+        return jsonify({'success': False, 'error': 'Admin key required to load archive data'}), 403
 
     result = data_manager.load_cycle(cycle_key)
     touch_cycle_access(cycle_key)
@@ -2713,7 +2825,7 @@ def api_unload():
     except ValueError:
         return jsonify({'success': False, 'error': 'Invalid fhr'}), 400
 
-    result = data_manager.unload_forecast_hour(cycle_key, fhr)
+    result = data_manager.unload_forecast_hour(cycle_key, fhr, is_admin=check_admin_key())
     return jsonify(result)
 
 @app.route('/api/xsect')
@@ -2748,7 +2860,13 @@ def api_xsect():
     temp_cmap_param = request.args.get('temp_cmap', 'green_purple')
     if temp_cmap_param not in ('green_purple', 'white_zero', 'nws_ndfd'):
         temp_cmap_param = 'green_purple'
-    buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, temp_cmap=temp_cmap_param)
+    acquired = RENDER_SEMAPHORE.acquire(timeout=10)
+    if not acquired:
+        return jsonify({'error': 'Server busy, try again in a moment'}), 503
+    try:
+        buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, temp_cmap=temp_cmap_param)
+    finally:
+        RENDER_SEMAPHORE.release()
     if buf is None:
         return jsonify({'error': 'Failed to generate cross-section. Data may not be loaded.'}), 500
 
@@ -2784,28 +2902,48 @@ def api_xsect_gif():
     if gif_temp_cmap not in ('green_purple', 'white_zero', 'nws_ndfd'):
         gif_temp_cmap = 'green_purple'
 
-    # Get loaded FHRs for this cycle, sorted
-    loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items if ck == cycle_key)
+    # Get loaded FHRs for this cycle — only every 3rd hour for smooth animation
+    loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items
+                         if ck == cycle_key and fhr % 3 == 0)
     if len(loaded_fhrs) < 2:
-        return jsonify({'error': f'Need at least 2 loaded FHRs for GIF (have {len(loaded_fhrs)})'}), 400
+        return jsonify({'error': f'Need at least 2 loaded FHRs (every 3h) for GIF (have {len(loaded_fhrs)})'}), 400
 
     # Lock terrain to first FHR so elevation doesn't jitter between frames
     terrain_data = data_manager.get_terrain_data(start, end, cycle_key, loaded_fhrs[0], style)
 
-    frames = []
-    for fhr in loaded_fhrs:
-        buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, terrain_data=terrain_data, temp_cmap=gif_temp_cmap)
-        if buf is not None:
-            frames.append(imageio.imread(buf))
+    # GIF holds the semaphore for its entire render sequence (7 frames)
+    acquired = RENDER_SEMAPHORE.acquire(timeout=30)
+    if not acquired:
+        return jsonify({'error': 'Server busy, try again in a moment'}), 503
+    try:
+        frames = []
+        for fhr in loaded_fhrs:
+            buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, terrain_data=terrain_data, temp_cmap=gif_temp_cmap)
+            if buf is not None:
+                frames.append(imageio.imread(buf))
+    finally:
+        RENDER_SEMAPHORE.release()
 
     if len(frames) < 2:
         return jsonify({'error': 'Failed to generate enough frames'}), 500
 
-    speed = request.args.get('speed', 'normal')
-    frame_duration = 1.5 if speed == 'slow' else 0.8
+    # Speed multiplier: 1x = 800ms base, 0.5x = 1600ms, 0.25x = 3200ms
+    BASE_FRAME_MS = 800
+    try:
+        speed_mult = float(request.args.get('speed', '0.5'))
+        speed_mult = max(0.25, min(1.0, speed_mult))
+    except ValueError:
+        speed_mult = 0.5
+    frame_ms = int(BASE_FRAME_MS / speed_mult)
 
+    # Use Pillow with disposal=2 (replace each frame) to prevent flickering on Discord
     gif_buf = io.BytesIO()
-    imageio.mimwrite(gif_buf, frames, format='GIF', duration=frame_duration, loop=0)
+    pil_frames = [Image.fromarray(f) for f in frames]
+    pil_frames[0].save(
+        gif_buf, format='GIF', save_all=True,
+        append_images=pil_frames[1:],
+        duration=frame_ms, loop=0, disposal=2
+    )
     gif_buf.seek(0)
 
     touch_cycle_access(cycle_key)
@@ -2875,7 +3013,10 @@ def api_request():
 @app.route('/api/request_cycle', methods=['POST'])
 @rate_limit
 def api_request_cycle():
-    """Download F00-F18 for a specific date/init cycle."""
+    """Download F00-F18 for a specific date/init cycle. Requires admin key."""
+    if not check_admin_key():
+        return jsonify({'error': 'Admin key required to download archive data'}), 403
+
     date_str = request.args.get('date', '')  # YYYYMMDD
     hour = int(request.args.get('hour', -1))
     max_fhr = int(request.args.get('max_fhr', 18))
@@ -3027,6 +3168,8 @@ def main():
             time.sleep(60)  # Re-scan every 60 seconds
             try:
                 data_manager.scan_available_cycles()
+                # Auto-load new PRELOAD_FHRS for latest 2 cycles
+                data_manager.auto_load_latest()
             except Exception as e:
                 logger.warning(f"Background rescan failed: {e}")
 

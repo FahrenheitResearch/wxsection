@@ -799,6 +799,7 @@ class InteractiveCrossSection:
         units: str = "km",
         terrain_data: Dict = None,
         temp_cmap: str = "green_purple",
+        metadata: Dict = None,
     ) -> Optional[bytes]:
         """Generate cross-section from pre-loaded data.
 
@@ -851,15 +852,13 @@ class InteractiveCrossSection:
                     data[key] = terrain_data[key]
 
         # Build metadata for labels
-        # Use _real_forecast_hour if set by dashboard (engine_key != real fhr)
-        real_fhr = getattr(self, '_real_forecast_hour', fhr_data.forecast_hour)
-        metadata = {
-            'model': self.model,
-            'init_date': self.init_date,
-            'init_hour': self.init_hour,
-            'forecast_hour': real_fhr,
-        }
-        self._real_forecast_hour = None  # Reset after use
+        if metadata is None:
+            metadata = {
+                'model': self.model,
+                'init_date': self.init_date,
+                'init_hour': self.init_hour,
+                'forecast_hour': fhr_data.forecast_hour,
+            }
 
         # Render
         img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top, units=units, temp_cmap=temp_cmap)
@@ -1376,7 +1375,7 @@ class InteractiveCrossSection:
             if temp_c is not None:
                 # Build colormap from selected option
                 cmap_obj = self._build_temp_colormap(temp_cmap)
-                cf = ax.contourf(X, Y, temp_c, levels=np.arange(-65, 55, 2), cmap=cmap_obj, extend='both')
+                cf = ax.contourf(X, Y, temp_c, levels=np.arange(-66, 56, 2), cmap=cmap_obj, extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
                 cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Temperature (°C)')
@@ -1918,8 +1917,8 @@ class InteractiveCrossSection:
             pass  # Skip inset if cartopy fails
 
         # Add credit
-        fig.text(0.5, 0.005, 'Contributors: @jasonbweather, justincat66, Sequoiagrove & others',
-                 ha='center', va='bottom', fontsize=8, color='#888888',
+        fig.text(0.5, 0.005, 'Produced by drewsny  |  Contributors: @jasonbweather, justincat66, Sequoiagrove, California Wildfire Tracking & others',
+                 ha='center', va='bottom', fontsize=7, color='#888888',
                  transform=fig.transFigure, style='italic', fontweight='bold')
 
         # Save to bytes (don't use tight_layout or bbox_inches - conflicts with inset positioning)
