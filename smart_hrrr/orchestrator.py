@@ -41,7 +41,7 @@ def download_forecast_hour(
     """Download GRIB files for a single forecast hour."""
 
     if file_types is None:
-        file_types = ['pressure', 'surface']  # wrfprs and wrfsfc
+        file_types = ['pressure', 'surface', 'native']  # wrfprs, wrfsfc, wrfnat
 
     registry = get_model_registry()
     model_config = registry.get_model(model)

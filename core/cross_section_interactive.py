@@ -52,6 +52,10 @@ class ForecastHourData:
     cloud: np.ndarray = None  # kg/kg
     dew_point: np.ndarray = None  # K
 
+    # Smoke on native hybrid levels (NOT isobaric) — preserves boundary layer detail
+    smoke_hyb: np.ndarray = None  # (n_hyb, ny, nx) μg/m³ PM2.5 on hybrid levels
+    smoke_pres_hyb: np.ndarray = None  # (n_hyb, ny, nx) pressure in hPa at each hybrid level
+
     # Surface fields: (ny, nx)
     surface_pressure: np.ndarray = None  # hPa
 
@@ -154,6 +158,51 @@ def _load_hour_process(grib_file: str, forecast_hour: int) -> Optional[ForecastH
             except Exception:
                 pass
 
+            # Load smoke (MASSDEN) from wrfnat if available — keep on native hybrid levels
+            try:
+                nat_file = Path(grib_file).parent / Path(grib_file).name.replace('wrfprs', 'wrfnat')
+                if nat_file.exists():
+                    import eccodes
+                    smoke_levels = {}
+                    pres_levels_hyb = {}
+                    fnat = open(str(nat_file), 'rb')
+                    while True:
+                        msg = eccodes.codes_grib_new_from_file(fnat)
+                        if msg is None:
+                            break
+                        try:
+                            disc = eccodes.codes_get(msg, 'discipline')
+                            cat = eccodes.codes_get(msg, 'parameterCategory')
+                            num = eccodes.codes_get(msg, 'parameterNumber')
+                            lt = eccodes.codes_get(msg, 'typeOfLevel')
+                            lev = eccodes.codes_get(msg, 'level')
+                            if lt == 'hybrid':
+                                Ni = eccodes.codes_get(msg, 'Ni')
+                                Nj = eccodes.codes_get(msg, 'Nj')
+                                if disc == 0 and cat == 20 and num == 0:
+                                    smoke_levels[lev] = eccodes.codes_get_values(msg).reshape(Nj, Ni)
+                                elif disc == 0 and cat == 3 and num == 0 and lev not in pres_levels_hyb:
+                                    pres_levels_hyb[lev] = eccodes.codes_get_values(msg).reshape(Nj, Ni)
+                        except Exception:
+                            pass
+                        eccodes.codes_release(msg)
+                    fnat.close()
+
+                    if smoke_levels and pres_levels_hyb:
+                        levels_sorted = sorted(smoke_levels.keys())
+                        ny, nx = list(smoke_levels.values())[0].shape
+                        n_hyb = len(levels_sorted)
+                        smoke_hyb = np.zeros((n_hyb, ny, nx), dtype=np.float32)
+                        pres_hyb = np.zeros((n_hyb, ny, nx), dtype=np.float32)
+                        for idx, lv in enumerate(levels_sorted):
+                            smoke_hyb[idx] = smoke_levels[lv] * 1e9
+                            if lv in pres_levels_hyb:
+                                pres_hyb[idx] = pres_levels_hyb[lv] / 100.0
+                        fhr_data.smoke_hyb = smoke_hyb
+                        fhr_data.smoke_pres_hyb = pres_hyb
+            except Exception:
+                pass
+
             # Pre-compute theta
             if fhr_data.temperature is not None:
                 theta = np.zeros_like(fhr_data.temperature)
@@ -252,7 +301,8 @@ class InteractiveCrossSection:
 
         for field in ['pressure_levels', 'lats', 'lons', 'temperature', 'u_wind', 'v_wind',
                       'rh', 'omega', 'specific_humidity', 'geopotential_height', 'vorticity',
-                      'cloud', 'dew_point', 'surface_pressure', 'theta', 'temp_c']:
+                      'cloud', 'dew_point', 'smoke_hyb', 'smoke_pres_hyb',
+                      'surface_pressure', 'theta', 'temp_c']:
             arr = getattr(fhr_data, field, None)
             if arr is not None:
                 data[field] = arr
@@ -276,7 +326,8 @@ class InteractiveCrossSection:
             # Load optional arrays
             for field in ['temperature', 'u_wind', 'v_wind', 'rh', 'omega',
                           'specific_humidity', 'geopotential_height', 'vorticity',
-                          'cloud', 'dew_point', 'surface_pressure', 'theta', 'temp_c']:
+                          'cloud', 'dew_point', 'smoke_hyb', 'smoke_pres_hyb',
+                          'surface_pressure', 'theta', 'temp_c']:
                 if field in data:
                     setattr(fhr_data, field, data[field])
 
@@ -284,6 +335,71 @@ class InteractiveCrossSection:
         except Exception as e:
             print(f"Error loading from cache: {e}")
             return None
+
+    def _load_smoke_from_wrfnat(self, nat_file: str) -> Optional[tuple]:
+        """Load MASSDEN (smoke PM2.5) from wrfnat GRIB using eccodes.
+
+        MASSDEN is GRIB2 discipline=0, category=20, number=0 on hybrid levels.
+        cfgrib can't identify this field (shows as 'unknown'), so we use eccodes directly.
+
+        Returns (smoke_hyb, pres_hyb) on native hybrid levels — no interpolation
+        to isobaric. This preserves the fine vertical resolution in the boundary
+        layer where smoke concentrates (~10-15 levels in lowest 2 km).
+
+        smoke_hyb: (n_hyb, ny, nx) in μg/m³
+        pres_hyb:  (n_hyb, ny, nx) in hPa (varies per column due to terrain)
+        """
+        import eccodes
+
+        # Read MASSDEN and pressure on hybrid levels
+        smoke_levels = {}  # level -> 2D array (kg/m³)
+        pres_levels = {}   # level -> 2D array (Pa)
+
+        f = open(nat_file, 'rb')
+        try:
+            while True:
+                msg = eccodes.codes_grib_new_from_file(f)
+                if msg is None:
+                    break
+                try:
+                    disc = eccodes.codes_get(msg, 'discipline')
+                    cat = eccodes.codes_get(msg, 'parameterCategory')
+                    num = eccodes.codes_get(msg, 'parameterNumber')
+                    ltype = eccodes.codes_get(msg, 'typeOfLevel')
+                    level = eccodes.codes_get(msg, 'level')
+
+                    if ltype == 'hybrid':
+                        Ni = eccodes.codes_get(msg, 'Ni')
+                        Nj = eccodes.codes_get(msg, 'Nj')
+                        if disc == 0 and cat == 20 and num == 0:
+                            # MASSDEN - smoke mass density
+                            smoke_levels[level] = eccodes.codes_get_values(msg).reshape(Nj, Ni)
+                        elif disc == 0 and cat == 3 and num == 0 and level not in pres_levels:
+                            # Pressure on hybrid levels (shortName='pres')
+                            pres_levels[level] = eccodes.codes_get_values(msg).reshape(Nj, Ni)
+                except Exception:
+                    pass
+                eccodes.codes_release(msg)
+        finally:
+            f.close()
+
+        if not smoke_levels or not pres_levels:
+            return None
+
+        # Build sorted 3D arrays (sorted by hybrid level number)
+        levels_sorted = sorted(smoke_levels.keys())
+        ny, nx = list(smoke_levels.values())[0].shape
+        n_hyb = len(levels_sorted)
+
+        smoke_hyb = np.zeros((n_hyb, ny, nx), dtype=np.float32)
+        pres_hyb = np.zeros((n_hyb, ny, nx), dtype=np.float32)
+
+        for idx, lev in enumerate(levels_sorted):
+            smoke_hyb[idx] = smoke_levels[lev] * 1e9  # kg/m³ → μg/m³
+            if lev in pres_levels:
+                pres_hyb[idx] = pres_levels[lev] / 100.0  # Pa → hPa
+
+        return smoke_hyb, pres_hyb
 
     def load_forecast_hour(self, grib_file: str, forecast_hour: int, progress_callback=None) -> bool:
         """Load all fields for a forecast hour into memory.
@@ -306,6 +422,25 @@ class InteractiveCrossSection:
             start = time.time()
             fhr_data = self._load_from_cache(cache_path)
             if fhr_data is not None:
+                # Backfill smoke if missing from cache but wrfnat now available
+                if fhr_data.smoke_hyb is None:
+                    nat_file = Path(grib_file).parent / Path(grib_file).name.replace('wrfprs', 'wrfnat')
+                    if nat_file.exists():
+                        print(f"  Backfilling smoke from wrfnat...")
+                        try:
+                            result = self._load_smoke_from_wrfnat(str(nat_file))
+                            if result is not None:
+                                fhr_data.smoke_hyb, fhr_data.smoke_pres_hyb = result
+                                print(f"  Loaded PM2.5 smoke on {fhr_data.smoke_hyb.shape[0]} hybrid levels "
+                                      f"(max={np.nanmax(fhr_data.smoke_hyb):.1f} μg/m³)")
+                                # Update cache with smoke included
+                                try:
+                                    self._save_to_cache(fhr_data, cache_path)
+                                    print(f"  Updated cache with smoke data")
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            print(f"  Warning: Could not backfill smoke: {e}")
                 self.forecast_hours[forecast_hour] = fhr_data
                 duration = time.time() - start
                 print(f"  Loaded F{forecast_hour:02d} from cache in {duration:.1f}s ({fhr_data.memory_usage_mb():.0f} MB)")
@@ -318,7 +453,7 @@ class InteractiveCrossSection:
             'w': 'Omega', 'q': 'Sp. Humidity', 'gh': 'Geopotential',
             'absv': 'Vorticity', 'clwmr': 'Cloud Water', 'dpt': 'Dew Point',
         }
-        total_steps = 12  # 10 fields + surface pressure + derived
+        total_steps = 13  # 10 fields + surface pressure + smoke + derived
 
         try:
             import cfgrib
@@ -415,8 +550,21 @@ class InteractiveCrossSection:
                 except Exception as e:
                     print(f"  Warning: Could not load surface pressure: {e}")
 
+                # Load smoke (MASSDEN PM2.5) from wrfnat file if available
+                cb(12, total_steps, "Reading Smoke (PM2.5)...")
+                try:
+                    nat_file = Path(grib_file).parent / Path(grib_file).name.replace('wrfprs', 'wrfnat')
+                    if nat_file.exists():
+                        result = self._load_smoke_from_wrfnat(str(nat_file))
+                        if result is not None:
+                            fhr_data.smoke_hyb, fhr_data.smoke_pres_hyb = result
+                            print(f"  Loaded PM2.5 smoke on {fhr_data.smoke_hyb.shape[0]} hybrid levels "
+                                  f"(max={np.nanmax(fhr_data.smoke_hyb):.1f} μg/m³)")
+                except Exception as e:
+                    print(f"  Warning: Could not load smoke from wrfnat: {e}")
+
                 # Pre-compute theta and temp_c
-                cb(12, total_steps, "Computing derived fields...")
+                cb(13, total_steps, "Computing derived fields...")
                 if fhr_data.temperature is not None:
                     P_ref = 1000.0
                     kappa = 0.286
@@ -820,6 +968,12 @@ class InteractiveCrossSection:
         if style in ['rh', 'q'] and fhr_data.rh is not None:
             result['rh'] = interp_3d(fhr_data.rh)
 
+        if style == 'smoke' and fhr_data.smoke_hyb is not None:
+            # Interpolate smoke and its pressure coordinate along path on native hybrid levels
+            # interp_3d works on any (n_levels, ny, nx) array — hybrid levels work the same way
+            result['smoke_hyb'] = interp_3d(fhr_data.smoke_hyb)  # (n_hyb, n_points)
+            result['smoke_pres_hyb'] = interp_3d(fhr_data.smoke_pres_hyb)  # (n_hyb, n_points)
+
         if style == 'omega' and fhr_data.omega is not None:
             result['omega'] = interp_3d(fhr_data.omega)
 
@@ -1064,6 +1218,7 @@ class InteractiveCrossSection:
         geopotential_height = filter_levels(geopotential_height)
 
         # Also filter style-specific arrays from data dict
+        # Note: smoke_hyb/smoke_pres_hyb are on native hybrid levels, not isobaric — filtered separately in render
         for key in ['rh', 'omega', 'vorticity', 'cloud', 'temperature', 'temp_c',
                     'specific_humidity', 'theta_e', 'shear', 'dew_point', 'frontogenesis',
                     'icing', 'wetbulb', 'lapse_rate']:
@@ -1268,6 +1423,62 @@ class InteractiveCrossSection:
                 cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Vorticity (10⁻⁵/s)')
                 shading_label = "ζ"
+        elif style == "smoke":
+            smoke_hyb = data.get('smoke_hyb')  # (n_hyb, n_points)
+            smoke_pres = data.get('smoke_pres_hyb')  # (n_hyb, n_points) — pressure in hPa
+            if smoke_hyb is not None and smoke_pres is not None:
+                from config.colormaps import create_all_colormaps
+                smoke_cmap = create_all_colormaps()['NOAASmoke']
+
+                # Build smoke's own X/Y mesh on native hybrid levels
+                # Y = per-column pressure (varies with terrain), X = distance along path
+                n_hyb, n_pts = smoke_hyb.shape
+                X_smoke = np.broadcast_to(distances[np.newaxis, :], (n_hyb, n_pts))
+                Y_smoke = smoke_pres  # (n_hyb, n_pts) — native pressure coordinate
+
+                # Filter to visible pressure range (y_top to 1050 hPa)
+                # Keep hybrid levels where at least some points are in range
+                y_bot = 1050.0
+                mask = np.any((Y_smoke >= y_top) & (Y_smoke <= y_bot), axis=1)
+                if np.any(mask):
+                    X_smoke = X_smoke[mask]
+                    Y_smoke = Y_smoke[mask]
+                    smoke_plot = smoke_hyb[mask]
+                else:
+                    smoke_plot = smoke_hyb
+
+                # Auto-scale with many levels for smooth shading
+                smoke_max = np.nanmax(smoke_plot)
+                if smoke_max > 100:
+                    cap = max(250, min(500, smoke_max * 1.1))
+                    levels = np.concatenate([
+                        np.linspace(0, 10, 10, endpoint=False),
+                        np.linspace(10, 55, 15, endpoint=False),
+                        np.linspace(55, cap, 25),
+                    ])
+                elif smoke_max > 10:
+                    cap = max(55, smoke_max * 1.2)
+                    levels = np.linspace(0, cap, 50)
+                else:
+                    levels = np.linspace(0, max(smoke_max * 1.3, 5), 50)
+
+                # Plot on smoke's own native-level grid (NOT the isobaric X, Y)
+                cf = ax.contourf(X_smoke, Y_smoke, smoke_plot, levels=levels,
+                                 cmap=smoke_cmap, extend='max')
+                cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+                if smoke_max > 100:
+                    ticks = [0, 5, 10, 20, 35, 55, 100, 150, 250]
+                    ticks = [t for t in ticks if t <= levels[-1]]
+                elif smoke_max > 10:
+                    ticks = [0, 5, 10, 20, 35, 55]
+                    ticks = [t for t in ticks if t <= levels[-1]]
+                else:
+                    ticks = None
+                cbar = plt.colorbar(cf, cax=cbar_ax, ticks=ticks)
+                cbar.set_label('PM2.5 (μg/m³)')
+
+
+                shading_label = "PM2.5 Smoke"
         elif style == "frontogenesis":
             # Winter Bander Mode - Petterssen Frontogenesis
             fronto = data.get('frontogenesis')

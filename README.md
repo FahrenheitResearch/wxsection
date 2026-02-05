@@ -13,6 +13,7 @@ Cross-sections slice through the atmosphere along a path between two geographic 
 - Rising/sinking motion (omega)
 - Snow banding potential (frontogenesis)
 - Icing hazards for aviation
+- Wildfire smoke plumes and air quality (PM2.5)
 
 ## Quick Start
 
@@ -34,7 +35,7 @@ cloudflared tunnel --url http://localhost:5559
 
 ### Interactive Web Dashboard
 - **Leaflet map** with click-to-place markers and draggable endpoints
-- **14 visualization styles** via dropdown with community voting
+- **15 visualization styles** via dropdown with community voting
 - **19 forecast hours** (F00-F18) with color-coded chip system:
   - **Grey** = downloaded, not loaded (click to load, ~15s)
   - **Green** = loaded in RAM (click for instant view)
@@ -113,6 +114,13 @@ cloudflared tunnel --url http://localhost:5559
 | `cloud` | Cloud water (g/kg) | Cloud layers |
 | `cloud_total` | All hydrometeors | Full precipitation picture |
 
+### Smoke & Air Quality
+| Style | Shows | Use For |
+|-------|-------|---------|
+| `smoke` | PM2.5 concentration (μg/m³) | **Wildfire smoke plumes, air quality** |
+
+Smoke data comes from HRRR-Smoke MASSDEN field in wrfnat files (~670MB each), read via eccodes (cfgrib can't identify this field). Smoke is kept on **native hybrid levels** (50 levels) rather than interpolated to isobaric — this preserves the fine vertical resolution (~10-15 levels in the lowest 2 km) where smoke concentrates. Each column has its own pressure coordinate that follows terrain. Auto-scaled colormap adjusts to fire intensity with 50 smooth contour levels. AQI reference contours at 35 (Moderate), 55 (USG), 150 (Unhealthy), 250 (Very Unhealthy) μg/m³. Requires wrfnat GRIB files — downloaded automatically alongside wrfprs/wrfsfc.
+
 ### Winter Weather & Aviation
 | Style | Shows | Use For |
 |-------|-------|---------|
@@ -183,7 +191,7 @@ tools/
 │   └── Thread-safe parallel loading
 │
 └── auto_update.py            # Continuous download daemon
-    ├── Progressive download  # Latest 2 cycles, F00-F18
+    ├── Progressive download  # Latest 2 cycles, F00-F18 (wrfprs + wrfsfc + wrfnat)
     └── Space-based cleanup   # Evicts least-popular when disk full
 
 core/
@@ -195,7 +203,9 @@ core/
 │   ├── A/B endpoint labels and legend
 │   ├── km/mi unit conversion at render time
 │   ├── Progress callback for field-level tracking
-│   └── NWS NDFD temperature colormap
+│   ├── NWS NDFD temperature colormap
+│   ├── Smoke on native hybrid levels (50 levels, not isobaric)
+│   └── Smoke backfill: auto-loads from wrfnat when cache is stale
 │
 └── cross_section_production.py   # Batch processing
 
@@ -216,13 +226,14 @@ data/
 
 | Loaded | RAM Usage |
 |--------|-----------|
-| 1 forecast hour | ~3.5 GB |
-| Even FHRs, 1 cycle (F00,F02,...,F18) | ~27 GB |
-| Even FHRs, 2 cycles (preloaded) | ~53 GB |
+| 1 forecast hour (without smoke) | ~3.7 GB |
+| 1 forecast hour (with smoke/wrfnat) | ~4.4 GB |
+| Even FHRs, 1 cycle (F00,F02,...,F18) | ~27-44 GB |
+| Even FHRs, 2 cycles (preloaded) | ~53-88 GB |
 | Max before eviction | 115 GB |
 | Hard cap | 117 GB |
 
-The dashboard pre-loads even forecast hours from the latest 2 cycles at startup. Odd hours load on-demand (~15s from NPZ cache). LRU eviction kicks in at 115 GB.
+The dashboard pre-loads even forecast hours from the latest 2 cycles at startup. Odd hours load on-demand (~15s from NPZ cache). LRU eviction kicks in at 115 GB. Smoke adds ~0.76 GB per FHR (50 hybrid levels × 2 arrays) when wrfnat files are available — a 21% increase over base.
 
 ## Command Line Options
 
@@ -255,10 +266,11 @@ HRRR GRIB2 files with pressure-level data:
 ```
 outputs/hrrr/{YYYYMMDD}/{HH}z/F{XX}/
 ├── hrrr.t{HH}z.wrfprsf{XX}.grib2  # Pressure levels (required)
-└── hrrr.t{HH}z.wrfsfcf{XX}.grib2  # Surface (for terrain)
+├── hrrr.t{HH}z.wrfsfcf{XX}.grib2  # Surface (for terrain)
+└── hrrr.t{HH}z.wrfnatf{XX}.grib2  # Native levels (for smoke, ~670MB)
 ```
 
-Required fields: Temperature, U/V wind, RH, geopotential height, specific humidity, vorticity, cloud water, dew point on isobaric levels. Surface pressure from surface file for terrain.
+Required fields: Temperature, U/V wind, RH, geopotential height, specific humidity, vorticity, cloud water, dew point on isobaric levels. Surface pressure from surface file for terrain. MASSDEN (smoke PM2.5, GRIB2 disc=0/cat=20/num=0) from native-level file for smoke style — read via eccodes because cfgrib can't identify this field (shows as `unknown` with paramId=0). Stored on native hybrid levels with per-column pressure, not interpolated to isobaric.
 
 Data is automatically downloaded from NOAA NOMADS (recent, <48h) or AWS archive (older) by the auto-update daemon or on-demand via the calendar request button.
 

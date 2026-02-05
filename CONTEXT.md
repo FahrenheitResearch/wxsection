@@ -10,7 +10,7 @@ Focused repo for interactive HRRR cross-section visualization.
 - **Dashboard**: `tools/unified_dashboard.py` - Flask + Leaflet interactive map
 - **Cross-section engine**: `core/cross_section_interactive.py` - Sub-second generation
 - **NPZ caching**: `cache/dashboard/xsect/` (~2s per hour from cache vs 25s from GRIB, 400GB limit with eviction)
-- **14 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis
+- **15 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis, smoke
 - **Color-coded chip UI**: Grey (on disk) / Green (in RAM) / Blue (viewing) / Yellow (loading) / Shift+click to unload
 - **Plot annotations**: A/B labels, ~100+ city labels, lat/lon secondary axis, legend box, inset map with A/B badges
 - **Distance units**: km/mi toggle at render time
@@ -48,6 +48,9 @@ tools/unified_dashboard.py
 - **City labels**: `ax.secondary_xaxis(-0.08)` for aligned secondary axis, 120km search radius, `used_cities` set for dedup
 - **Unit conversion**: `dist_scale = KM_TO_MI if use_miles else 1.0` applied to distances at render time, all internal math stays in km
 - **Figure size**: `figsize=(17, 11)`, axes at `[0.06, 0.12, 0.82, 0.68]`
+- **Smoke loading**: Uses eccodes (not cfgrib) to read MASSDEN (disc=0, cat=20, num=0) from wrfnat — cfgrib can't identify this field (shows as `unknown`). Kept on **native hybrid levels** (50 levels, ~10-15 packed in lowest 2km) with per-column pressure coordinate — NOT interpolated to isobaric. This preserves boundary layer vertical detail where smoke concentrates. Stored as `smoke_hyb` + `smoke_pres_hyb` in ForecastHourData and NPZ cache. Units: kg/m³ × 10⁹ = μg/m³. Plotted with its own X/Y mesh (pressure varies per column due to terrain).
+- **Smoke backfill**: When loading from NPZ cache, if `smoke_hyb` is missing but wrfnat file exists, smoke is automatically loaded from wrfnat and cache is updated. Handles transition from pre-smoke caches.
+- **Auto-update wrfnat awareness**: `auto_update.py` checks for wrfnat completeness — an FHR is only "downloaded" if wrfprs AND wrfnat both exist. Downloads wrfprs, wrfsfc, and wrfnat for all cycles.
 
 ### Key APIs
 ```python

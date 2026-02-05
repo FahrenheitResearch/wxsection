@@ -235,6 +235,7 @@ XSECT_STYLES = [
     ('wetbulb', 'Wet-Bulb Temp'),
     ('icing', 'Icing Potential'),
     ('frontogenesis', '❄ Frontogenesis'),  # Winter Bander mode
+    ('smoke', 'PM2.5 Smoke'),
 ]
 
 # =============================================================================

@@ -67,12 +67,17 @@ def get_latest_two_cycles():
 
 
 def get_downloaded_fhrs(date_str, hour):
-    """Check which forecast hours are already downloaded for a cycle."""
+    """Check which forecast hours are already downloaded for a cycle.
+
+    An FHR is considered complete only if wrfprs, wrfsfc, AND wrfnat all exist.
+    """
     run_dir = BASE_DIR / date_str / f"{hour:02d}z"
     downloaded = []
     for fhr in range(19):  # F00-F18
         fhr_dir = run_dir / f"F{fhr:02d}"
-        if fhr_dir.exists() and list(fhr_dir.glob("*wrfprs*.grib2")):
+        if (fhr_dir.exists()
+            and list(fhr_dir.glob("*wrfprs*.grib2"))
+            and list(fhr_dir.glob("*wrfnat*.grib2"))):
             downloaded.append(fhr)
     return downloaded
 
