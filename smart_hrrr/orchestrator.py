@@ -88,10 +88,13 @@ def download_gribs_parallel(
     forecast_hours: List[int],
     output_base_dir: Path = None,
     max_threads: int = 8,
-    file_types: List[str] = None
+    file_types: List[str] = None,
+    on_complete=None,
 ) -> Dict[int, bool]:
     """Download GRIB files for multiple forecast hours in parallel.
 
+    Args:
+        on_complete: Optional callback(fhr, success) called as each FHR finishes.
     Returns dict mapping forecast_hour -> success status.
     """
 
@@ -114,6 +117,8 @@ def download_gribs_parallel(
         for future in as_completed(futures):
             fhr, ok = future.result()
             results[fhr] = ok
+            if on_complete:
+                on_complete(fhr, ok)
 
     return results
 

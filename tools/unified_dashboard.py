@@ -45,6 +45,13 @@ REQUESTS_FILE = Path(__file__).parent.parent / 'data' / 'requests.json'
 FAVORITES_FILE = Path(__file__).parent.parent / 'data' / 'favorites.json'
 DISK_META_FILE = Path(__file__).parent.parent / 'data' / 'disk_meta.json'
 DISK_LIMIT_GB = 500  # Max disk usage for HRRR data
+CLIMATOLOGY_DIR = Path('/mnt/hrrr/climatology')
+
+# Styles that support anomaly mode (must match ANOMALY_STYLES in cross_section_interactive.py)
+ANOMALY_STYLES = {
+    'temp', 'wind_speed', 'rh', 'omega', 'theta_e',
+    'q', 'vorticity', 'shear', 'lapse_rate', 'wetbulb',
+}
 
 def load_votes():
     """Load votes from JSON file."""
@@ -274,7 +281,7 @@ ADMIN_KEY = os.environ.get('WXSECTION_KEY', '')
 
 def check_admin_key():
     """Check if request has valid admin key (query param or header)."""
-    key = request.args.get('key', '') or request.headers.get('X-Admin-Key', '')
+    key = (request.args.get('key', '') or request.headers.get('X-Admin-Key', '')).strip()
     return bool(ADMIN_KEY) and key == ADMIN_KEY
 
 def rate_limit(f):
@@ -344,7 +351,7 @@ class CrossSectionManager:
 
     FORECAST_HOURS = list(range(19))  # F00-F18
     PRELOAD_FHRS = [0, 3, 6, 9, 12, 15, 18]  # Every 3rd hour for preloading
-    PRELOAD_WORKERS = 4  # Parallel workers for loading FHRs
+    PRELOAD_WORKERS = 2  # Parallel workers for loading FHRs (keep low to avoid memory/IO pressure)
     PRELOAD_CYCLES = 0  # Don't pre-load; load on demand
     MEM_LIMIT_MB = 117000  # 117 GB hard cap
     MEM_EVICT_MB = 115000  # Start evicting at 115 GB
@@ -357,6 +364,7 @@ class CrossSectionManager:
         self.loaded_items = []  # List of (cycle_key, fhr) currently in memory (ordered by load time = LRU)
         self.current_cycle = None  # Currently selected cycle
         self._lock = threading.Lock()  # Protects all state mutations
+        self._loading = threading.Lock()  # Prevents overlapping bulk loads (preload vs load_cycle)
         self._engine_key_map = {}  # (cycle_key, fhr) -> unique engine int key
         self._next_engine_key = 0  # Counter for unique keys
 
@@ -408,6 +416,9 @@ class CrossSectionManager:
         if self.xsect is None:
             from core.cross_section_interactive import InteractiveCrossSection
             self.xsect = InteractiveCrossSection(cache_dir='cache/dashboard/xsect')
+            if CLIMATOLOGY_DIR.exists():
+                self.xsect.set_climatology_dir(str(CLIMATOLOGY_DIR))
+                logger.info(f"Climatology dir set: {CLIMATOLOGY_DIR}")
 
     def scan_available_cycles(self):
         """Scan for all available cycles on disk WITHOUT loading data."""
@@ -467,7 +478,7 @@ class CrossSectionManager:
                 'hour': c['hour'],
                 'fhrs': c['available_fhrs'],
                 'fhr_count': len(c['available_fhrs']),
-                'loaded': c['cycle_key'] in self.loaded_cycles,
+                'loaded': any(ck == c['cycle_key'] for ck, _ in self.loaded_items),
             }
             for c in self.available_cycles
         ]
@@ -477,10 +488,32 @@ class CrossSectionManager:
         if n_cycles is None:
             n_cycles = self.PRELOAD_CYCLES
 
+        with self._loading:
+            self._preload_latest_cycles_inner(n_cycles)
+
+    def _preload_latest_cycles_inner(self, n_cycles):
         self.init_engine()
 
         # Newest cycles first (available_cycles already sorted newest-first)
         cycles_to_load = self.available_cycles[:n_cycles]
+
+        # Count total FHRs across all cycles for progress
+        all_fhrs = []
+        for cycle in cycles_to_load:
+            cycle_key = cycle['cycle_key']
+            with self._lock:
+                fhrs = [fhr for fhr in cycle['available_fhrs']
+                        if fhr in self.PRELOAD_FHRS
+                        and (cycle_key, fhr) not in self.loaded_items]
+            all_fhrs.extend((cycle, fhr) for fhr in fhrs)
+
+        if not all_fhrs:
+            return
+
+        total = len(all_fhrs)
+        done = [0]
+        op_id = "preload:startup"
+        progress_update(op_id, 0, total, "Starting...", label="Pre-loading latest cycles")
 
         for cycle in cycles_to_load:
             cycle_key = cycle['cycle_key']
@@ -507,7 +540,8 @@ class CrossSectionManager:
                 prs_files = list((run_path / f"F{fhr:02d}").glob("*wrfprs*.grib2"))
                 if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
                     with self._lock:
-                        self.loaded_items.append((cycle_key, fhr))
+                        if (cycle_key, fhr) not in self.loaded_items:
+                            self.loaded_items.append((cycle_key, fhr))
                     return fhr, True
                 return fhr, False
 
@@ -519,18 +553,32 @@ class CrossSectionManager:
                 for future in as_completed(futures):
                     try:
                         fhr, ok = future.result()
+                        done[0] += 1
                         if ok:
                             logger.info(f"  Loaded {cycle_key} F{fhr:02d}")
+                            progress_update(op_id, done[0], total, f"Loaded {cycle_key} F{fhr:02d}")
+                        else:
+                            progress_update(op_id, done[0], total, f"Failed {cycle_key} F{fhr:02d}")
                     except Exception as e:
+                        done[0] += 1
                         logger.warning(f"  Failed to load FHR: {e}")
 
-            with self._lock:
-                self.loaded_cycles.add(cycle_key)
             mem_mb = self.xsect.get_memory_usage()
             logger.info(f"  {cycle['display']} done ({mem_mb:.0f} MB total)")
 
+        progress_done(op_id)
+
     def auto_load_latest(self):
         """Check latest 2 cycles for new PRELOAD_FHRS on disk and load them into RAM."""
+        if not self._loading.acquire(blocking=False):
+            logger.info("Skipping auto-load — another load operation in progress")
+            return
+        try:
+            self._auto_load_latest_inner()
+        finally:
+            self._loading.release()
+
+    def _auto_load_latest_inner(self):
         if not self.xsect or not self.available_cycles:
             return
 
@@ -561,7 +609,8 @@ class CrossSectionManager:
                 prs_files = list((run_path / f"F{fhr:02d}").glob("*wrfprs*.grib2"))
                 if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
                     with self._lock:
-                        self.loaded_items.append((cycle_key, fhr))
+                        if (cycle_key, fhr) not in self.loaded_items:
+                            self.loaded_items.append((cycle_key, fhr))
                     return fhr, True
                 return fhr, False
 
@@ -578,9 +627,6 @@ class CrossSectionManager:
                     except Exception as e:
                         logger.warning(f"  Auto-load failed: {e}")
 
-            with self._lock:
-                self.loaded_cycles.add(cycle_key)
-
     def get_loaded_status(self):
         """Return current memory status."""
         mem_mb = self.xsect.get_memory_usage() if self.xsect else 0
@@ -593,13 +639,24 @@ class CrossSectionManager:
 
     def load_cycle(self, cycle_key: str) -> dict:
         """Load an entire cycle (all available FHRs) into memory, parallel."""
-        with self._lock:
-            if cycle_key in self.loaded_cycles:
-                return {'success': True, 'already_loaded': True}
+        if not self._loading.acquire(timeout=120):
+            return {'success': False, 'error': 'Timed out waiting for other load to finish'}
+        try:
+            return self._load_cycle_inner(cycle_key)
+        finally:
+            self._loading.release()
 
+    def _load_cycle_inner(self, cycle_key: str) -> dict:
+        with self._lock:
             cycle = next((c for c in self.available_cycles if c['cycle_key'] == cycle_key), None)
             if not cycle:
                 return {'success': False, 'error': f'Cycle {cycle_key} not found'}
+
+            # Check if ALL available FHRs are already loaded
+            loaded_fhrs = {fhr for ck, fhr in self.loaded_items if ck == cycle_key}
+            if loaded_fhrs >= set(cycle['available_fhrs']):
+                mem_mb = self.xsect.get_memory_usage() if self.xsect else 0
+                return {'success': True, 'already_loaded': True, 'loaded_fhrs': len(loaded_fhrs), 'memory_mb': round(mem_mb, 0)}
 
             self.init_engine()
 
@@ -630,7 +687,8 @@ class CrossSectionManager:
             prs_files = list((run_path / f"F{fhr:02d}").glob("*wrfprs*.grib2"))
             if prs_files and self.xsect.load_forecast_hour(str(prs_files[0]), engine_key):
                 with self._lock:
-                    self.loaded_items.append((cycle_key, fhr))
+                    if (cycle_key, fhr) not in self.loaded_items:
+                        self.loaded_items.append((cycle_key, fhr))
                 return fhr, True
             return fhr, False
 
@@ -657,7 +715,7 @@ class CrossSectionManager:
         return {
             'success': True,
             'cycle': cycle_key,
-            'loaded_fhrs': loaded_count,
+            'loaded_fhrs': loaded_count[0],
             'memory_mb': round(mem_mb, 0),
         }
 
@@ -705,7 +763,8 @@ class CrossSectionManager:
         if success:
             load_time = time.time() - load_start
             with self._lock:
-                self.loaded_items.append((cycle_key, fhr))
+                if (cycle_key, fhr) not in self.loaded_items:
+                    self.loaded_items.append((cycle_key, fhr))
                 self.current_cycle = cycle_key
             mem_mb = self.xsect.get_memory_usage()
             logger.info(f"Loaded {cycle_key} F{fhr:02d} in {load_time:.1f}s (Total: {mem_mb:.0f} MB)")
@@ -746,7 +805,7 @@ class CrossSectionManager:
             'memory_mb': round(mem_mb, 0),
         }
 
-    def generate_cross_section(self, start, end, cycle_key, fhr, style, y_axis='pressure', vscale=1.0, y_top=100, units='km', terrain_data=None, temp_cmap='green_purple'):
+    def generate_cross_section(self, start, end, cycle_key, fhr, style, y_axis='pressure', vscale=1.0, y_top=100, units='km', terrain_data=None, temp_cmap='green_purple', anomaly=False):
         """Generate a cross-section for a loaded forecast hour."""
         if not self.xsect:
             return None
@@ -782,12 +841,14 @@ class CrossSectionManager:
                 terrain_data=terrain_data,
                 temp_cmap=temp_cmap,
                 metadata=meta,
+                anomaly=anomaly,
             )
             if png_bytes is None:
                 return None
             return io.BytesIO(png_bytes)
         except Exception as e:
-            logger.error(f"Cross-section error: {e}")
+            import traceback
+            logger.error(f"Cross-section error: {e}\n{traceback.format_exc()}")
             return None
 
     def get_terrain_data(self, start, end, cycle_key, fhr, style):
@@ -809,6 +870,7 @@ class CrossSectionManager:
             'surface_pressure': data.get('surface_pressure'),
             'surface_pressure_hires': data.get('surface_pressure_hires'),
             'distances_hires': data.get('distances_hires'),
+            'pressure_levels': fhr_data.pressure_levels,
         }
 
     # Legacy compatibility methods
@@ -972,6 +1034,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .toggle-btn.active {
             background: var(--accent);
             color: #000;
+        }
+        .toggle-btn.anomaly-active {
+            background: #FF6D00;
+            color: #fff;
+            font-weight: bold;
         }
 
         /* Smaller selects for vscale and ytop */
@@ -1483,6 +1550,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     </select>
                     <button class="help-btn" id="help-btn" title="Style explanations & feedback">?</button>
                 </div>
+                <div class="control-group" id="anomaly-group" style="display:none">
+                    <label>Mode:</label>
+                    <div class="toggle-group">
+                        <button class="toggle-btn active" id="anomaly-off">Raw</button>
+                        <button class="toggle-btn" id="anomaly-on">5yr Dep</button>
+                    </div>
+                </div>
                 <div class="control-group">
                     <label>Y-Axis:</label>
                     <div class="toggle-group">
@@ -1532,6 +1606,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </select>
                 <button id="clear-btn">Clear Line</button>
                 <button id="admin-key-btn" title="Enter admin key for archive access" style="padding:4px 8px;font-size:13px;">🔒</button>
+                <button id="load-all-btn" title="Load all FHRs for current cycle" style="padding:4px 8px;font-size:12px;display:none;">Load All</button>
                 <div id="memory-status">
                     <span id="mem-text">0 MB</span>
                     <div class="mem-bar"><div class="mem-fill" id="mem-fill" style="width:0%"></div></div>
@@ -1634,6 +1709,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const btn = document.getElementById('admin-key-btn');
             btn.textContent = valid ? '🔓' : '🔒';
             btn.title = valid ? 'Admin mode active (click to change key)' : 'Enter admin key for archive access';
+            document.getElementById('load-all-btn').style.display = valid ? '' : 'none';
         }
         document.getElementById('admin-key-btn').onclick = async function() {
             const key = prompt(isAdmin ? 'Admin key (current key active, clear to revoke):' : 'Enter admin key:', getAdminKey());
@@ -1644,6 +1720,32 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             showToast(isAdmin ? 'Admin access granted' : 'Invalid key', isAdmin ? 'success' : 'error', 2000);
         };
         checkAdminKey();
+
+        // Load All button (admin only) — loads every FHR for current cycle
+        document.getElementById('load-all-btn').onclick = async () => {
+            if (!currentCycle || !isAdmin) return;
+            const btn = document.getElementById('load-all-btn');
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+            const toast = showToast(`Loading all FHRs for ${currentCycle}...`);
+            try {
+                const res = await fetch(`/api/load_cycle?cycle=${currentCycle}${adminParam()}`, {method: 'POST'});
+                const data = await res.json();
+                toast.remove();
+                if (data.success) {
+                    showToast(`Loaded ${data.loaded_fhrs} FHRs (${Math.round(data.memory_mb || 0)} MB)`, 'success');
+                    await refreshLoadedStatus();
+                    updateChipStates();
+                } else {
+                    showToast(data.error || 'Load failed', 'error');
+                }
+            } catch (err) {
+                toast.remove();
+                showToast('Load all failed: ' + err.message, 'error');
+            }
+            btn.disabled = false;
+            btn.textContent = 'Load All';
+        };
 
         // Initialize map
         const map = L.map('map', {
@@ -1696,8 +1798,59 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function updateTempCmapVisibility() {
             tempCmapSelect.style.display = styleSelect.value === 'temp' ? '' : 'none';
         }
-        styleSelect.onchange = () => { updateTempCmapVisibility(); generateCrossSection(); };
+        styleSelect.onchange = () => { updateTempCmapVisibility(); updateAnomalyVisibility(); generateCrossSection(); };
         tempCmapSelect.onchange = generateCrossSection;
+
+        // =========================================================================
+        // Anomaly Mode Toggle
+        // =========================================================================
+        let anomalyMode = false;
+        let anomalyStyles = new Set();
+        let climatologyAvailable = false;
+        const anomalyGroup = document.getElementById('anomaly-group');
+        const anomalyOffBtn = document.getElementById('anomaly-off');
+        const anomalyOnBtn = document.getElementById('anomaly-on');
+
+        anomalyOffBtn.onclick = () => {
+            if (!anomalyMode) return;
+            anomalyMode = false;
+            anomalyOffBtn.classList.add('active');
+            anomalyOnBtn.classList.remove('active', 'anomaly-active');
+            generateCrossSection();
+        };
+        anomalyOnBtn.onclick = () => {
+            if (anomalyMode) return;
+            anomalyMode = true;
+            anomalyOffBtn.classList.remove('active');
+            anomalyOnBtn.classList.add('active', 'anomaly-active');
+            generateCrossSection();
+        };
+
+        function updateAnomalyVisibility() {
+            const style = styleSelect.value;
+            if (climatologyAvailable && anomalyStyles.has(style)) {
+                anomalyGroup.style.display = '';
+            } else {
+                anomalyGroup.style.display = 'none';
+                if (anomalyMode) {
+                    anomalyMode = false;
+                    anomalyOffBtn.classList.add('active');
+                    anomalyOnBtn.classList.remove('active', 'anomaly-active');
+                }
+            }
+        }
+
+        // Check climatology availability on load
+        fetch('/api/climatology_status')
+            .then(r => r.json())
+            .then(data => {
+                climatologyAvailable = data.available;
+                if (data.anomaly_styles) {
+                    anomalyStyles = new Set(data.anomaly_styles);
+                }
+                updateAnomalyVisibility();
+            })
+            .catch(() => {});
 
         // =========================================================================
         // Y-Axis Toggle (Pressure / Height)
@@ -2387,7 +2540,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const tempCmap = document.getElementById('temp-cmap-select').value;
             const url = `/api/xsect?start_lat=${start.lat}&start_lon=${start.lng}` +
                 `&end_lat=${end.lat}&end_lon=${end.lng}&cycle=${currentCycle}&fhr=${activeFhr}&style=${style}` +
-                `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}&units=${units}&temp_cmap=${tempCmap}`;
+                `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}&units=${units}&temp_cmap=${tempCmap}` +
+                `&anomaly=${anomalyMode ? 1 : 0}`;
 
             try {
                 const res = await fetch(url);
@@ -2428,7 +2582,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const url = `/api/xsect_gif?start_lat=${start.lat}&start_lon=${start.lng}` +
                 `&end_lat=${end.lat}&end_lon=${end.lng}&cycle=${currentCycle}&style=${style}` +
                 `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}&units=${units}&speed=${speed}` +
-                `&temp_cmap=${document.getElementById('temp-cmap-select').value}`;
+                `&temp_cmap=${document.getElementById('temp-cmap-select').value}` +
+                `&anomaly=${anomalyMode ? 1 : 0}` + adminParam();
             try {
                 const res = await fetch(url);
                 if (!res.ok) {
@@ -2750,6 +2905,29 @@ def api_check_key():
     """Check if the provided admin key is valid."""
     return jsonify({'valid': check_admin_key(), 'protected': list(data_manager.get_protected_cycles())})
 
+@app.route('/api/climatology_status')
+def api_climatology_status():
+    """Return climatology availability for anomaly mode."""
+    if not CLIMATOLOGY_DIR.exists():
+        return jsonify({'available': False})
+    # Scan for available climo files
+    months = {}
+    for npz in CLIMATOLOGY_DIR.glob('climo_*.npz'):
+        parts = npz.stem.split('_')  # climo_01_00z_F06
+        if len(parts) == 4:
+            month = int(parts[1])
+            init = parts[2]  # "00z"
+            if month not in months:
+                months[month] = set()
+            months[month].add(init)
+    # Convert sets to sorted lists
+    months = {m: sorted(inits) for m, inits in sorted(months.items())}
+    return jsonify({
+        'available': len(months) > 0,
+        'months': months,
+        'anomaly_styles': sorted(ANOMALY_STYLES),
+    })
+
 @app.route('/api/status')
 def api_status():
     """Return current memory/loading status."""
@@ -2860,11 +3038,12 @@ def api_xsect():
     temp_cmap_param = request.args.get('temp_cmap', 'green_purple')
     if temp_cmap_param not in ('green_purple', 'white_zero', 'nws_ndfd'):
         temp_cmap_param = 'green_purple'
+    anomaly_param = request.args.get('anomaly', '0') == '1'
     acquired = RENDER_SEMAPHORE.acquire(timeout=10)
     if not acquired:
         return jsonify({'error': 'Server busy, try again in a moment'}), 503
     try:
-        buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, temp_cmap=temp_cmap_param)
+        buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, temp_cmap=temp_cmap_param, anomaly=anomaly_param)
     finally:
         RENDER_SEMAPHORE.release()
     if buf is None:
@@ -2901,24 +3080,30 @@ def api_xsect_gif():
     gif_temp_cmap = request.args.get('temp_cmap', 'green_purple')
     if gif_temp_cmap not in ('green_purple', 'white_zero', 'nws_ndfd'):
         gif_temp_cmap = 'green_purple'
+    gif_anomaly = request.args.get('anomaly', '0') == '1'
 
-    # Get loaded FHRs for this cycle — only every 3rd hour for smooth animation
-    loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items
-                         if ck == cycle_key and fhr % 3 == 0)
+    # Admin gets all loaded FHRs (up to 19 frames); regular users get every 3rd hour only
+    if check_admin_key():
+        loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items
+                             if ck == cycle_key)
+    else:
+        loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items
+                             if ck == cycle_key and fhr % 3 == 0)
     if len(loaded_fhrs) < 2:
-        return jsonify({'error': f'Need at least 2 loaded FHRs (every 3h) for GIF (have {len(loaded_fhrs)})'}), 400
+        return jsonify({'error': f'Need at least 2 loaded FHRs for GIF (have {len(loaded_fhrs)})'}), 400
 
     # Lock terrain to first FHR so elevation doesn't jitter between frames
     terrain_data = data_manager.get_terrain_data(start, end, cycle_key, loaded_fhrs[0], style)
 
-    # GIF holds the semaphore for its entire render sequence (7 frames)
-    acquired = RENDER_SEMAPHORE.acquire(timeout=30)
+    # GIF holds the semaphore for its entire render sequence (up to 19 frames for admin)
+    sem_timeout = 90 if check_admin_key() else 30
+    acquired = RENDER_SEMAPHORE.acquire(timeout=sem_timeout)
     if not acquired:
         return jsonify({'error': 'Server busy, try again in a moment'}), 503
     try:
         frames = []
         for fhr in loaded_fhrs:
-            buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, terrain_data=terrain_data, temp_cmap=gif_temp_cmap)
+            buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, terrain_data=terrain_data, temp_cmap=gif_temp_cmap, anomaly=gif_anomaly)
             if buf is not None:
                 frames.append(imageio.imread(buf))
     finally:
@@ -2927,14 +3112,10 @@ def api_xsect_gif():
     if len(frames) < 2:
         return jsonify({'error': 'Failed to generate enough frames'}), 500
 
-    # Speed multiplier: 1x = 800ms base, 0.5x = 1600ms, 0.25x = 3200ms
-    BASE_FRAME_MS = 800
-    try:
-        speed_mult = float(request.args.get('speed', '0.5'))
-        speed_mult = max(0.25, min(1.0, speed_mult))
-    except ValueError:
-        speed_mult = 0.5
-    frame_ms = int(BASE_FRAME_MS / speed_mult)
+    # Speed: 1x = 250ms (fast), 0.75x = 500ms, 0.5x = 1000ms, 0.25x = 2000ms
+    SPEED_MS = {'1': 250, '0.75': 500, '0.5': 1000, '0.25': 2000}
+    speed_key = request.args.get('speed', '0.5')
+    frame_ms = SPEED_MS.get(speed_key, 1000)
 
     # Use Pillow with disposal=2 (replace each frame) to prevent flickering on Discord
     gif_buf = io.BytesIO()
@@ -3039,26 +3220,39 @@ def api_request_cycle():
     age_hours = (datetime.now(timezone.utc) - date_dt).total_seconds() / 3600
     source = "AWS archive" if age_hours > 48 else "NOMADS"
 
-    # Download in background
+    # Download in background with progress tracking
     def download_cycle():
         from smart_hrrr.orchestrator import download_gribs_parallel
         from smart_hrrr.io import create_output_structure
 
+        op_id = f"download:{cycle_key}"
+        fhrs = list(range(max_fhr + 1))
+        completed = [0]
+
+        def on_fhr_done(fhr, ok):
+            completed[0] += 1
+            status = f"F{fhr:02d} {'OK' if ok else 'FAILED'}"
+            progress_update(op_id, completed[0], len(fhrs), status)
+
         try:
             create_output_structure('hrrr', date_str, hour)
-            fhrs = list(range(max_fhr + 1))
+            progress_update(op_id, 0, len(fhrs), f"Downloading from {source}...",
+                            label=f"Downloading {cycle_key}")
             results = download_gribs_parallel(
                 model='hrrr',
                 date_str=date_str,
                 cycle_hour=hour,
                 forecast_hours=fhrs,
-                max_threads=4
+                max_threads=4,
+                on_complete=on_fhr_done,
             )
             success = sum(1 for ok in results.values() if ok)
             logger.info(f"Cycle request {cycle_key}: {success}/{len(fhrs)} forecast hours downloaded")
             data_manager.scan_available_cycles()
         except Exception as e:
             logger.warning(f"Cycle request {cycle_key} failed: {e}")
+        finally:
+            progress_done(op_id)
 
     t = threading.Thread(target=download_cycle, daemon=True)
     t.start()

@@ -72,6 +72,37 @@ class ForecastHourData:
         return total / 1024 / 1024
 
 
+@dataclass
+class ClimatologyData:
+    """Holds coarsened climatology grid for anomaly computation."""
+    month: int
+    init_hour: int
+    fhr: int
+    pressure_levels: np.ndarray      # (n_levels,)
+    lats: np.ndarray                 # (ny_coarse,) or (ny_coarse, nx_coarse)
+    lons: np.ndarray                 # (nx_coarse,) or (ny_coarse, nx_coarse)
+
+    # Coarsened mean fields: (n_levels, ny_coarse, nx_coarse)
+    temperature: np.ndarray = None
+    u_wind: np.ndarray = None
+    v_wind: np.ndarray = None
+    rh: np.ndarray = None
+    omega: np.ndarray = None
+    specific_humidity: np.ndarray = None
+    geopotential_height: np.ndarray = None
+    vorticity: np.ndarray = None
+
+    n_samples: int = 0
+    years: List[int] = field(default_factory=list)
+
+
+# Styles that support anomaly mode
+ANOMALY_STYLES = {
+    'temp', 'wind_speed', 'rh', 'omega', 'theta_e',
+    'q', 'vorticity', 'shear', 'lapse_rate', 'wetbulb',
+}
+
+
 # Standalone function for multiprocessing (must be at module level for pickle)
 def _load_hour_process(grib_file: str, forecast_hour: int) -> Optional[ForecastHourData]:
     """Load a single forecast hour - standalone function for ProcessPoolExecutor."""
@@ -256,6 +287,10 @@ class InteractiveCrossSection:
         self.init_date = None  # YYYYMMDD
         self.init_hour = None  # HH
 
+        # Climatology for anomaly mode
+        self.climatology_dir = None  # Path to climo NPZ directory
+        self._climo_cache: Dict[str, ClimatologyData] = {}  # "MM_HHz_FNN" -> data
+
     def _get_cache_path(self, grib_file: str) -> Optional[Path]:
         """Get cache path for a GRIB file."""
         if not self.cache_dir:
@@ -421,6 +456,10 @@ class InteractiveCrossSection:
             print(f"Loading F{forecast_hour:02d} from cache...")
             start = time.time()
             fhr_data = self._load_from_cache(cache_path)
+            if fhr_data is not None and len(fhr_data.pressure_levels) < 35:
+                print(f"  Cache has only {len(fhr_data.pressure_levels)} levels (expected 40), discarding stale cache")
+                cache_path.unlink(missing_ok=True)
+                fhr_data = None
             if fhr_data is not None:
                 # Backfill smoke if missing from cache but wrfnat now available
                 if fhr_data.smoke_hyb is None:
@@ -784,6 +823,211 @@ class InteractiveCrossSection:
             print(f"Error loading F{forecast_hour:02d}: {e}")
             return None
 
+    # ── Climatology methods for anomaly mode ──
+
+    def set_climatology_dir(self, path: str):
+        """Set directory containing climatology NPZ files."""
+        self.climatology_dir = Path(path) if path else None
+        self._climo_cache.clear()
+
+    def has_climatology(self, month: int, init_hour: int) -> bool:
+        """Check if any climatology exists for this month/init."""
+        if not self.climatology_dir or not self.climatology_dir.exists():
+            return False
+        return bool(list(self.climatology_dir.glob(
+            f"climo_{month:02d}_{init_hour:02d}z_F*.npz"
+        )))
+
+    def get_climatology(self, month: int, init_hour: int, fhr: int) -> Optional[ClimatologyData]:
+        """Load climatology for given month/init/fhr. Caches in RAM."""
+        if not self.climatology_dir:
+            return None
+
+        key = f"{month:02d}_{init_hour:02d}z_F{fhr:02d}"
+        if key in self._climo_cache:
+            return self._climo_cache[key]
+
+        climo_path = self.climatology_dir / f"climo_{key}.npz"
+        if not climo_path.exists():
+            # Fall back to nearest available FHR
+            candidates = sorted(self.climatology_dir.glob(
+                f"climo_{month:02d}_{init_hour:02d}z_F*.npz"
+            ))
+            if not candidates:
+                return None
+            best = min(candidates,
+                       key=lambda p: abs(int(p.stem.split('_F')[1]) - fhr))
+            climo_path = best
+            key = best.stem.replace('climo_', '')
+            if key in self._climo_cache:
+                return self._climo_cache[key]
+
+        try:
+            data = np.load(climo_path)
+            climo = ClimatologyData(
+                month=month,
+                init_hour=init_hour,
+                fhr=fhr,
+                pressure_levels=data['pressure_levels'],
+                lats=data['lats'],
+                lons=data['lons'],
+                n_samples=int(data['n_samples'][0]),
+                years=data.get('years', np.array([])).tolist(),
+            )
+            for field_name in ('temperature', 'u_wind', 'v_wind', 'rh', 'omega',
+                               'specific_humidity', 'geopotential_height', 'vorticity'):
+                if field_name in data:
+                    setattr(climo, field_name, data[field_name])
+
+            self._climo_cache[key] = climo
+            return climo
+        except Exception as e:
+            print(f"Failed to load climatology {climo_path.name}: {e}")
+            return None
+
+    def _interpolate_climatology_to_path(
+        self,
+        climo: ClimatologyData,
+        path_lats: np.ndarray,
+        path_lons: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """Interpolate coarsened climatology grids to cross-section path.
+
+        Returns dict of field_name -> (n_levels, n_points) arrays.
+        """
+        from scipy.interpolate import RegularGridInterpolator
+
+        n_points = len(path_lats)
+        pts = np.column_stack([path_lats, path_lons])
+
+        climo_lats = climo.lats if climo.lats.ndim == 1 else climo.lats[:, 0]
+        climo_lons = climo.lons if climo.lons.ndim == 1 else climo.lons[0, :]
+
+        # Ensure lats are ascending for RegularGridInterpolator
+        lat_ascending = climo_lats[0] < climo_lats[-1]
+
+        result = {}
+        for field_name in ('temperature', 'u_wind', 'v_wind', 'rh', 'omega',
+                           'specific_humidity', 'geopotential_height', 'vorticity'):
+            field_3d = getattr(climo, field_name, None)
+            if field_3d is None:
+                continue
+            n_levels = field_3d.shape[0]
+            interp_result = np.full((n_levels, n_points), np.nan)
+            for lev in range(n_levels):
+                lev_data = field_3d[lev]
+                lat_coords = climo_lats
+                if not lat_ascending:
+                    lev_data = lev_data[::-1, :]
+                    lat_coords = climo_lats[::-1]
+                try:
+                    interp = RegularGridInterpolator(
+                        (lat_coords, climo_lons), lev_data,
+                        method='linear', bounds_error=False, fill_value=np.nan
+                    )
+                    interp_result[lev, :] = interp(pts)
+                except Exception:
+                    pass
+            result[field_name] = interp_result
+
+        return result
+
+    def _apply_anomaly(self, data: Dict, climo_path: Dict, style: str) -> Dict:
+        """Subtract climatology from forecast data to produce anomalies.
+
+        Stores result in data['anomaly']. Raw fields are NOT modified,
+        so theta contours, freezing level, wind barbs, terrain stay absolute.
+        """
+        if style not in ANOMALY_STYLES:
+            return data
+
+        pressure_levels = data.get('pressure_levels')
+
+        if style == 'temp':
+            if 'temp_c' in data and 'temperature' in climo_path:
+                climo_c = climo_path['temperature'] - 273.15
+                data['anomaly'] = data['temp_c'] - climo_c
+
+        elif style == 'wind_speed':
+            if 'u_wind' in data and 'v_wind' in data:
+                fcst_wspd = np.sqrt(data['u_wind']**2 + data['v_wind']**2) * 1.944
+                if 'u_wind' in climo_path and 'v_wind' in climo_path:
+                    climo_wspd = np.sqrt(climo_path['u_wind']**2 + climo_path['v_wind']**2) * 1.944
+                    data['anomaly'] = fcst_wspd - climo_wspd
+
+        elif style == 'rh':
+            if 'rh' in data and 'rh' in climo_path:
+                data['anomaly'] = data['rh'] - climo_path['rh']
+
+        elif style == 'omega':
+            if 'omega' in data and 'omega' in climo_path:
+                data['anomaly'] = (data['omega'] - climo_path['omega']) * 36.0
+
+        elif style == 'theta_e':
+            if 'theta_e' in data and 'temperature' in climo_path and 'specific_humidity' in climo_path:
+                climo_T = climo_path['temperature']
+                climo_q = climo_path['specific_humidity']
+                if pressure_levels is not None:
+                    climo_theta = np.zeros_like(climo_T)
+                    for lev_idx, p in enumerate(pressure_levels):
+                        if lev_idx < climo_T.shape[0]:
+                            climo_theta[lev_idx] = climo_T[lev_idx] * (1000.0 / p) ** 0.286
+                    Lv, cp = 2.5e6, 1004.0
+                    with np.errstate(invalid='ignore', divide='ignore'):
+                        climo_theta_e = climo_theta * np.exp(Lv * climo_q / (cp * climo_T))
+                    data['anomaly'] = data['theta_e'] - climo_theta_e
+
+        elif style == 'q':
+            if 'specific_humidity' in data and 'specific_humidity' in climo_path:
+                data['anomaly'] = (data['specific_humidity'] - climo_path['specific_humidity']) * 1000
+
+        elif style == 'vorticity':
+            if 'vorticity' in data and 'vorticity' in climo_path:
+                data['anomaly'] = (data['vorticity'] - climo_path['vorticity']) * 1e5
+
+        elif style == 'shear':
+            if 'shear' in data and 'u_wind' in climo_path and 'v_wind' in climo_path and 'geopotential_height' in climo_path:
+                gh_c = climo_path['geopotential_height']
+                u_c, v_c = climo_path['u_wind'], climo_path['v_wind']
+                n_levels = gh_c.shape[0]
+                climo_shear = np.full_like(gh_c, np.nan)
+                for lev in range(n_levels - 1):
+                    dz = gh_c[lev, :] - gh_c[lev + 1, :]
+                    dz = np.where(np.abs(dz) < 10, np.nan, dz)
+                    du = u_c[lev, :] - u_c[lev + 1, :]
+                    dv = v_c[lev, :] - v_c[lev + 1, :]
+                    dwind = np.sqrt(du**2 + dv**2)
+                    climo_shear[lev, :] = (dwind / np.abs(dz)) * 1000
+                climo_shear[-1, :] = climo_shear[-2, :] if n_levels > 1 else 0
+                data['anomaly'] = data['shear'] - climo_shear
+
+        elif style == 'lapse_rate':
+            if 'lapse_rate' in data and 'temperature' in climo_path and 'geopotential_height' in climo_path:
+                T_c = climo_path['temperature']
+                gh_c = climo_path['geopotential_height']
+                n_levels = T_c.shape[0]
+                climo_lapse = np.full_like(T_c, np.nan)
+                for lev in range(n_levels - 1):
+                    dz = (gh_c[lev, :] - gh_c[lev + 1, :]) / 1000.0
+                    dz = np.where(np.abs(dz) < 0.01, np.nan, dz)
+                    dT = T_c[lev, :] - T_c[lev + 1, :]
+                    climo_lapse[lev, :] = -dT / dz
+                climo_lapse[-1, :] = climo_lapse[-2, :] if n_levels > 1 else 0
+                data['anomaly'] = data['lapse_rate'] - climo_lapse
+
+        elif style == 'wetbulb':
+            if 'wetbulb' in data and 'temperature' in climo_path and 'rh' in climo_path:
+                climo_tc = climo_path['temperature'] - 273.15
+                climo_rh = climo_path['rh']
+                climo_tw = (climo_tc * np.arctan(0.151977 * np.sqrt(climo_rh + 8.313659))
+                           + np.arctan(climo_tc + climo_rh)
+                           - np.arctan(climo_rh - 1.676331)
+                           + 0.00391838 * (climo_rh ** 1.5) * np.arctan(0.023101 * climo_rh)
+                           - 4.686035)
+                data['anomaly'] = data['wetbulb'] - climo_tw
+
+        return data
+
     def get_cross_section(
         self,
         start_point: Tuple[float, float],
@@ -800,6 +1044,7 @@ class InteractiveCrossSection:
         terrain_data: Dict = None,
         temp_cmap: str = "green_purple",
         metadata: Dict = None,
+        anomaly: bool = False,
     ) -> Optional[bytes]:
         """Generate cross-section from pre-loaded data.
 
@@ -820,6 +1065,7 @@ class InteractiveCrossSection:
             terrain_data: Optional dict with 'surface_pressure', 'surface_pressure_hires',
                          'distances_hires' keys to override terrain (for consistent GIF frames)
             temp_cmap: Temperature colormap choice ('green_purple', 'white_zero', 'nws_ndfd')
+            anomaly: If True, subtract climatological mean and use diverging colormap
 
         Returns:
             PNG image bytes, or data dict if return_image=False
@@ -846,10 +1092,13 @@ class InteractiveCrossSection:
             return data
 
         # Override terrain for consistent GIF frames
+        ref_pressure_levels = None
         if terrain_data is not None:
             for key in ('surface_pressure', 'surface_pressure_hires', 'distances_hires'):
                 if key in terrain_data:
                     data[key] = terrain_data[key]
+            # Lock y-axis range to first frame's pressure levels so axis doesn't shift between GIF frames
+            ref_pressure_levels = terrain_data.get('pressure_levels')
 
         # Build metadata for labels
         if metadata is None:
@@ -860,8 +1109,31 @@ class InteractiveCrossSection:
                 'forecast_hour': fhr_data.forecast_hour,
             }
 
+        # Anomaly mode: subtract climatological mean
+        climo_info = None
+        if anomaly and style in ANOMALY_STYLES:
+            init_date = metadata.get('init_date', self.init_date)
+            init_hr = metadata.get('init_hour', self.init_hour)
+            if init_date and init_hr is not None:
+                month = int(str(init_date)[4:6])
+                real_fhr = metadata.get('forecast_hour', forecast_hour)
+                climo = self.get_climatology(month, int(init_hr), real_fhr)
+                if climo is not None:
+                    climo_along_path = self._interpolate_climatology_to_path(
+                        climo, path_lats, path_lons
+                    )
+                    self._apply_anomaly(data, climo_along_path, style)
+                    month_names = ['Jan','Feb','Mar','Apr','May','Jun',
+                                   'Jul','Aug','Sep','Oct','Nov','Dec']
+                    climo_info = {
+                        'month': month,
+                        'month_name': month_names[month - 1],
+                        'n_samples': climo.n_samples,
+                        'years': climo.years,
+                    }
+
         # Render
-        img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top, units=units, temp_cmap=temp_cmap)
+        img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top, units=units, temp_cmap=temp_cmap, ref_pressure_levels=ref_pressure_levels, anomaly=anomaly, climo_info=climo_info)
 
         t_total = time.time() - start
         print(f"Cross-section generated in {t_total:.3f}s (interp: {t_interp:.3f}s)")
@@ -1214,7 +1486,9 @@ class InteractiveCrossSection:
 
     def _render_cross_section(self, data: Dict, style: str, dpi: int, metadata: Dict = None,
                                y_axis: str = "pressure", vscale: float = 1.0, y_top: int = 100,
-                               units: str = "km", temp_cmap: str = "green_purple") -> bytes:
+                               units: str = "km", temp_cmap: str = "green_purple",
+                               ref_pressure_levels: np.ndarray = None,
+                               anomaly: bool = False, climo_info: Dict = None) -> bytes:
         """Render cross-section to PNG bytes.
 
         Args:
@@ -1345,7 +1619,46 @@ class InteractiveCrossSection:
         # Style-specific shading
         shading_label = style
 
-        if style == "wind_speed" and wind_speed is not None:
+        # Anomaly labels per style
+        _ANOMALY_LABELS = {
+            'temp': ('Temperature Anomaly (°C)', 'Temperature Anomaly'),
+            'wind_speed': ('Wind Speed Anomaly (kts)', 'Wind Speed Anomaly'),
+            'rh': ('RH Anomaly (%)', 'RH Anomaly'),
+            'omega': ('Omega Anomaly (μb/s)', 'Omega Anomaly'),
+            'theta_e': ('θe Anomaly (K)', 'θe Anomaly'),
+            'q': ('Specific Humidity Anomaly (g/kg)', 'q Anomaly'),
+            'vorticity': ('Vorticity Anomaly (×10⁻⁵ s⁻¹)', 'Vorticity Anomaly'),
+            'shear': ('Shear Anomaly (kt/kft)', 'Shear Anomaly'),
+            'lapse_rate': ('Lapse Rate Anomaly (°C/km)', 'Lapse Rate Anomaly'),
+            'wetbulb': ('Wet Bulb Anomaly (°C)', 'Wet Bulb Anomaly'),
+        }
+
+        if anomaly and 'anomaly' in data:
+            # Anomaly mode: diverging colormap centered at 0
+            anomaly_field = data['anomaly']
+
+            # Symmetric auto-scaling from 98th percentile of |anomaly|
+            finite_vals = anomaly_field[np.isfinite(anomaly_field)]
+            if len(finite_vals) > 0:
+                vmax = np.percentile(np.abs(finite_vals), 98)
+                vmax = max(vmax, 0.1)  # Floor to avoid degenerate range
+            else:
+                vmax = 1.0
+
+            # Build symmetric levels centered at 0
+            n_levels_anom = 20
+            levels_anom = np.linspace(-vmax, vmax, n_levels_anom * 2 + 1)
+
+            cf = ax.contourf(X, Y, anomaly_field, levels=levels_anom,
+                            cmap='RdBu_r', extend='both')
+            cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+            cbar = plt.colorbar(cf, cax=cbar_ax)
+
+            cbar_label, shading_label = _ANOMALY_LABELS.get(
+                style, (f'{style} Anomaly', f'{style} Anomaly'))
+            cbar.set_label(cbar_label)
+
+        elif style == "wind_speed" and wind_speed is not None:
             # Wind speed colormap: PG&E/SJSU-WIRC style (smooth gradient)
             # Blues for light-moderate, magenta for strong, yellow-orange-red for extreme
             wspd_colors = [
@@ -1711,7 +2024,9 @@ class InteractiveCrossSection:
                 ax.plot(dist_hires, terrain_height_km, 'k-', linewidth=1.5, zorder=6)
             else:
                 # Pressure axis: fill below surface pressure
-                max_p = max(pressure_levels_filtered.max(), np.nanmax(sp_hires)) + 20
+                # Use ref levels for consistent terrain fill bottom across GIF frames
+                ref_max = ref_pressure_levels[ref_pressure_levels >= y_top].max() if ref_pressure_levels is not None else pressure_levels_filtered.max()
+                max_p = max(ref_max, np.nanmax(sp_hires)) + 20
                 terrain_x = np.concatenate([[dist_hires[0]], dist_hires, [dist_hires[-1]]])
                 terrain_y = np.concatenate([[max_p], sp_hires, [max_p]])
                 ax.fill(terrain_x, terrain_y, color='saddlebrown', alpha=0.9, zorder=5)
@@ -1728,7 +2043,10 @@ class InteractiveCrossSection:
             ax.yaxis.set_major_locator(MultipleLocator(2))  # Every 2 km
         else:
             # Pressure axis: high values at bottom (surface), low at top
-            ax.set_ylim(max(pressure_levels_filtered), min(pressure_levels_filtered))
+            # Use ref_pressure_levels for consistent y-axis across GIF frames
+            ylim_levels = ref_pressure_levels if ref_pressure_levels is not None else pressure_levels_filtered
+            ylim_levels_f = ylim_levels[ylim_levels >= y_top]
+            ax.set_ylim(max(ylim_levels_f), min(ylim_levels_f))
             ax.set_ylabel('Pressure (hPa)', fontsize=11)
             ax.yaxis.set_major_locator(MultipleLocator(100))
 
@@ -1756,6 +2074,15 @@ class InteractiveCrossSection:
         ax.set_title(title_main, fontsize=14, fontweight='bold', loc='left')
         ax.set_title(f'Init: {init_str}  |  F{forecast_hour:02d}  |  Valid: {valid_str}',
                     fontsize=10, loc='right', color='#555')
+
+        # Anomaly subtitle
+        if anomaly and climo_info:
+            n_yrs = len(climo_info.get('years', []))
+            n_samples = climo_info.get('n_samples', 0)
+            month_name = climo_info.get('month_name', '')
+            fig.text(0.06, 0.82, f'Departure from {n_yrs}-yr HRRR Mean ({month_name}, n={n_samples})',
+                    fontsize=10, style='italic', color='#B71C1C',
+                    transform=fig.transFigure)
 
         # A/B endpoint labels below the secondary axis
         total_dist = distances[-1]
