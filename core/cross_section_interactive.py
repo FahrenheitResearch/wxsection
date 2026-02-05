@@ -797,6 +797,8 @@ class InteractiveCrossSection:
         vscale: float = 1.0,
         y_top: int = 100,
         units: str = "km",
+        terrain_data: Dict = None,
+        temp_cmap: str = "green_purple",
     ) -> Optional[bytes]:
         """Generate cross-section from pre-loaded data.
 
@@ -814,6 +816,9 @@ class InteractiveCrossSection:
             vscale: Vertical exaggeration factor (1.0 = normal, 2.0 = 2x taller)
             y_top: Top of plot in hPa (100=full atmos, 300=mid, 500=low, 700=boundary layer)
             units: 'km' or 'mi' for distance axis
+            terrain_data: Optional dict with 'surface_pressure', 'surface_pressure_hires',
+                         'distances_hires' keys to override terrain (for consistent GIF frames)
+            temp_cmap: Temperature colormap choice ('green_purple', 'white_zero', 'nws_ndfd')
 
         Returns:
             PNG image bytes, or data dict if return_image=False
@@ -839,6 +844,12 @@ class InteractiveCrossSection:
         if not return_image:
             return data
 
+        # Override terrain for consistent GIF frames
+        if terrain_data is not None:
+            for key in ('surface_pressure', 'surface_pressure_hires', 'distances_hires'):
+                if key in terrain_data:
+                    data[key] = terrain_data[key]
+
         # Build metadata for labels
         # Use _real_forecast_hour if set by dashboard (engine_key != real fhr)
         real_fhr = getattr(self, '_real_forecast_hour', fhr_data.forecast_hour)
@@ -851,7 +862,7 @@ class InteractiveCrossSection:
         self._real_forecast_hour = None  # Reset after use
 
         # Render
-        img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top, units=units)
+        img_bytes = self._render_cross_section(data, style, dpi, metadata, y_axis, vscale, y_top, units=units, temp_cmap=temp_cmap)
 
         t_total = time.time() - start
         print(f"Cross-section generated in {t_total:.3f}s (interp: {t_interp:.3f}s)")
@@ -1119,9 +1130,92 @@ class InteractiveCrossSection:
             distances.append(distances[-1] + R * c)
         return np.array(distances)
 
+    @staticmethod
+    def _build_temp_colormap(name: str = "green_purple"):
+        """Build a temperature colormap by name.
+
+        Options:
+            green_purple: Green (0°C) -> yellow -> orange -> red -> purple (hot)
+            white_zero:   White (0°C) with purples below and warm colors above
+            nws_ndfd:     Classic NWS blue -> cyan -> yellow (0°C) -> orange -> red
+        """
+        import matplotlib.colors as mcolors
+
+        def from_f_anchors(anchors_f):
+            """Convert (°F, (R,G,B)) anchors to a LinearSegmentedColormap."""
+            anchors_c = [((f - 32) * 5/9, (r/255, g/255, b/255))
+                         for f, (r, g, b) in anchors_f]
+            vals = [a[0] for a in anchors_c]
+            cols = [a[1] for a in anchors_c]
+            norms = [(v - vals[0]) / (vals[-1] - vals[0]) for v in vals]
+            return mcolors.LinearSegmentedColormap.from_list(
+                f'temp_{name}', list(zip(norms, cols)), N=512)
+
+        if name == "white_zero":
+            # White at 0°C/32°F, purples below freezing, warm colors above
+            return from_f_anchors([
+                (-80, (100,  50, 150)),  # Deep purple (extreme cold)
+                (-60, (120,  60, 180)),  # Purple
+                (-40, (140,  80, 200)),  # Medium purple
+                (-20, (160, 110, 220)),  # Light purple
+                (  0, (190, 150, 230)),  # Pale purple
+                ( 15, (220, 200, 240)),  # Lavender
+                ( 32, (255, 255, 255)),  # White (freezing)
+                ( 45, (255, 240, 200)),  # Warm white
+                ( 55, (255, 220, 150)),  # Pale yellow
+                ( 65, (255, 200, 100)),  # Yellow-orange
+                ( 75, (255, 170,  70)),  # Orange
+                ( 85, (255, 130,  50)),  # Dark orange
+                ( 95, (240,  80,  30)),  # Red-orange
+                (105, (210,  40,  30)),  # Red
+                (115, (160,  20,  60)),  # Red-purple
+                (125, ( 90,  10, 140)),  # Deep purple (hot)
+            ])
+        elif name == "nws_ndfd":
+            # Classic NWS: purple -> blue -> cyan -> yellow (0°C) -> orange -> red
+            return from_f_anchors([
+                (-80, ( 75,   0, 130)),  # Indigo
+                (-60, (106,   0, 205)),  # Purple
+                (-40, (  0,   0, 205)),  # Dark blue
+                (-20, (  0,   0, 255)),  # Blue
+                (  0, (  0, 191, 255)),  # Deep sky blue
+                ( 15, (  0, 255, 255)),  # Cyan
+                ( 32, (255, 255,   0)),  # Yellow (freezing)
+                ( 50, (255, 215,   0)),  # Gold
+                ( 65, (255, 165,   0)),  # Orange
+                ( 80, (255,  69,   0)),  # Red-orange
+                (100, (255,   0,   0)),  # Red
+                (115, (180,   0,  60)),  # Red-purple
+                (125, ( 90,  10, 140)),  # Deep purple
+            ])
+        else:
+            # green_purple (default): blue-teal below freezing, green at 0°C, warm above
+            return from_f_anchors([
+                (-80, (220, 220, 255)),  # Pale blue-white (extreme cold)
+                (-60, (180, 180, 255)),  # Light blue
+                (-40, (140, 160, 240)),  # Blue
+                (-20, (100, 140, 220)),  # Medium blue
+                (  0, ( 60, 140, 160)),  # Blue-teal
+                ( 10, ( 60, 160, 130)),  # Teal-green
+                ( 20, ( 70, 180, 110)),  # Cool green
+                ( 32, ( 80, 160,  80)),  # Green (freezing 32°F/0°C)
+                ( 40, (140, 210, 140)),  # Light green
+                ( 50, (255, 225, 140)),  # Yellow
+                ( 60, (255, 200, 100)),  # Yellow-orange
+                ( 70, (255, 170,  80)),  # Orange
+                ( 80, (255, 140,  60)),  # Dark orange
+                ( 90, (255, 100,  40)),  # Red-orange
+                (100, (230,  60,  40)),  # Red
+                (105, (200,  30,  30)),  # Deep red
+                (110, (170,  20,  40)),  # Red-purple
+                (115, (140,  20,  70)),  # Purple-red
+                (120, (110,  20, 110)),  # Purple
+                (125, ( 90,  10, 140)),  # Deep purple
+            ])
+
     def _render_cross_section(self, data: Dict, style: str, dpi: int, metadata: Dict = None,
                                y_axis: str = "pressure", vscale: float = 1.0, y_top: int = 100,
-                               units: str = "km") -> bytes:
+                               units: str = "km", temp_cmap: str = "green_purple") -> bytes:
         """Render cross-section to PNG bytes.
 
         Args:
@@ -1186,8 +1280,13 @@ class InteractiveCrossSection:
         else:
             wind_speed = None
 
-        # NOTE: Terrain masking removed - let contourf fill entire grid
-        # The terrain fill (zorder=5) will cover underground portions
+        # Build terrain mask for contour lines (prevents theta/freezing level going underground)
+        # contourf is left unmasked — terrain fill (zorder=5) covers it visually
+        terrain_mask = None
+        if surface_pressure is not None:
+            terrain_mask = np.zeros((len(pressure_levels), n_points), dtype=bool)
+            for i in range(n_points):
+                terrain_mask[:, i] = pressure_levels > surface_pressure[i]
 
         # Create figure - 25% larger with room for inset above and labels below
         base_height = 11.0
@@ -1224,6 +1323,13 @@ class InteractiveCrossSection:
                     'icing', 'wetbulb', 'lapse_rate']:
             if key in data and data[key] is not None and data[key].ndim == 2:
                 data[key] = filter_levels(data[key])
+
+        # Filter terrain mask to same vertical range
+        if terrain_mask is not None:
+            terrain_mask = terrain_mask[level_mask, :]
+
+        # Re-read temperature after filtering (local var was extracted before filter_levels)
+        temperature = data.get('temperature')
 
         n_levels = len(pressure_levels_filtered)
 
@@ -1268,23 +1374,9 @@ class InteractiveCrossSection:
         elif style == "temp":
             temp_c = data.get('temp_c')
             if temp_c is not None:
-                # NWS NDFD temperature color table
-                # Purple (cold) -> Blue -> Cyan -> YELLOW at 0°C -> Orange -> Red -> Magenta (hot)
-                ndfd_temp_colors = [
-                    '#9400D3',  # -60°C  Purple (extreme cold)
-                    '#6A00CD',  # -50°C  Purple
-                    '#0000CD',  # -40°C  Dark blue
-                    '#0000FF',  # -30°C  Blue
-                    '#00BFFF',  # -20°C  Deep sky blue
-                    '#00FFFF',  # -10°C  Cyan
-                    '#FFFF00',  # 0°C    YELLOW (freezing)
-                    '#FFD700',  # 10°C   Gold
-                    '#FFA500',  # 20°C   Orange
-                    '#FF4500',  # 30°C   Red-orange
-                    '#FF0000',  # 40°C   Red (extreme heat)
-                ]
-                ndfd_cmap = mcolors.LinearSegmentedColormap.from_list('ndfd_temp', ndfd_temp_colors, N=256)
-                cf = ax.contourf(X, Y, temp_c, levels=np.arange(-60, 45, 5), cmap=ndfd_cmap, extend='both')
+                # Build colormap from selected option
+                cmap_obj = self._build_temp_colormap(temp_cmap)
+                cf = ax.contourf(X, Y, temp_c, levels=np.arange(-65, 55, 2), cmap=cmap_obj, extend='both')
                 cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
                 cbar = plt.colorbar(cf, cax=cbar_ax)
                 cbar.set_label('Temperature (°C)')
@@ -1515,14 +1607,16 @@ class InteractiveCrossSection:
                 cbar.set_label('θ (K)')
                 shading_label = "θ"
 
-        # Theta contours
+        # Theta contours (masked below terrain)
         if theta is not None:
-            cs = ax.contour(X, Y, theta, levels=np.arange(270, 330, 4), colors='black', linewidths=0.8)
+            theta_plot = np.ma.masked_where(terrain_mask, theta) if terrain_mask is not None else theta
+            cs = ax.contour(X, Y, theta_plot, levels=np.arange(270, 330, 4), colors='black', linewidths=0.8)
             ax.clabel(cs, inline=True, fontsize=8, fmt='%.0f')
 
-        # Temperature overlays (freezing level, DGZ, additional isotherms)
+        # Temperature overlays (freezing level, DGZ, additional isotherms) — masked below terrain
         if temperature is not None:
-            temp_c_plot = temperature - 273.15
+            temp_c_raw = temperature - 273.15
+            temp_c_plot = np.ma.masked_where(terrain_mask, temp_c_raw) if terrain_mask is not None else temp_c_raw
             try:
                 # Freezing level (0°C) - magenta
                 ax.contour(X, Y, temp_c_plot, levels=[0], colors='magenta', linewidths=2)
@@ -1824,7 +1918,7 @@ class InteractiveCrossSection:
             pass  # Skip inset if cartopy fails
 
         # Add credit
-        fig.text(0.5, 0.005, 'Contributors: @jasonbweather, Sequoiagrove & others',
+        fig.text(0.5, 0.005, 'Contributors: @jasonbweather, justincat66, Sequoiagrove & others',
                  ha='center', va='bottom', fontsize=8, color='#888888',
                  transform=fig.transFigure, style='italic', fontweight='bold')
 

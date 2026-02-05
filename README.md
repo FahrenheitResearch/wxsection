@@ -49,6 +49,8 @@ cloudflared tunnel --url http://localhost:5559
 - **Distance units toggle** - km or miles
 - **Community favorites** - save/load cross-section configs by name, auto-expire after 12h
 - **Feature request system** - users can submit and vote on feature ideas
+- **GIF animation** - generate animated GIF of all loaded forecast hours with normal/slow speed control
+- **Temperature colormap picker** - 3 color tables (Green-Purple, White at 0°C, NWS Classic) switchable on the fly
 
 ### Plot Annotations
 - **A/B endpoint labels** on the cross-section and inset map
@@ -101,7 +103,7 @@ cloudflared tunnel --url http://localhost:5559
 | Style | Shows | Use For |
 |-------|-------|---------|
 | `wind_speed` | Horizontal wind (kt) | Jet streams, wind maxima |
-| `temp` | Temperature (°C) with NWS NDFD colormap | Inversions, frontal zones |
+| `temp` | Temperature (°C) with 3 selectable colormaps | Inversions, frontal zones |
 | `theta_e` | Equivalent potential temp (K) | Warm/cold advection, instability |
 | `omega` | Vertical velocity | Rising (blue) / sinking (red) motion |
 | `vorticity` | Absolute vorticity | Cyclonic/anticyclonic patterns |
@@ -119,7 +121,7 @@ cloudflared tunnel --url http://localhost:5559
 |-------|-------|---------|
 | `smoke` | PM2.5 concentration (μg/m³) | **Wildfire smoke plumes, air quality** |
 
-Smoke data comes from HRRR-Smoke MASSDEN field in wrfnat files (~670MB each), read via eccodes (cfgrib can't identify this field). Smoke is kept on **native hybrid levels** (50 levels) rather than interpolated to isobaric — this preserves the fine vertical resolution (~10-15 levels in the lowest 2 km) where smoke concentrates. Each column has its own pressure coordinate that follows terrain. Auto-scaled colormap adjusts to fire intensity with 50 smooth contour levels. AQI reference contours at 35 (Moderate), 55 (USG), 150 (Unhealthy), 250 (Very Unhealthy) μg/m³. Requires wrfnat GRIB files — downloaded automatically alongside wrfprs/wrfsfc.
+Smoke data comes from HRRR-Smoke MASSDEN field in wrfnat files (~670MB each), read via eccodes (cfgrib can't identify this field). Smoke is kept on **native hybrid levels** (50 levels) rather than interpolated to isobaric — this preserves the fine vertical resolution (~10-15 levels in the lowest 2 km) where smoke concentrates. Each column has its own pressure coordinate that follows terrain. Auto-scaled colormap adjusts to fire intensity with 50 smooth contour levels. Requires wrfnat GRIB files — downloaded automatically alongside wrfprs/wrfsfc.
 
 ### Winter Weather & Aviation
 | Style | Shows | Use For |
@@ -131,17 +133,24 @@ Smoke data comes from HRRR-Smoke MASSDEN field in wrfnat files (~670MB each), re
 | `lapse_rate` | Temp lapse rate (°C/km) | Stability analysis |
 
 ### All Styles Include
-- **Theta contours** (black lines) - atmospheric stability
-- **Wind barbs** with actual U and V components
-- **Freezing level** (magenta line) - 0°C isotherm
-- **Terrain fill** (brown) - contourf fills entire grid, terrain covers underground (standard met practice)
+- **Theta contours** (black lines) - atmospheric stability, masked below terrain
+- **Wind barbs** with actual U and V components, masked below terrain
+- **Freezing level** (magenta line) - 0°C isotherm, masked below terrain
+- **Terrain fill** (brown) - hi-res ~1.5km sampling with bilinear interpolation
 - **Legend box** identifying overlays
 - **A/B endpoint markers** on plot and inset map
 - **City labels** with lat/lon and distance along path
 
-### Temperature Colormap
-Uses the NWS NDFD color table with 0°C (freezing) = yellow:
-- Purple (-60°C) -> Blue (-30°C) -> Cyan (-10°C) -> **Yellow (0°C)** -> Orange (20°C) -> Red (40°C)
+### Temperature Colormaps
+Three selectable color tables (dropdown appears when Temperature style is active):
+
+| Colormap | 0°C (32°F) | Cold End | Hot End | Best For |
+|----------|-----------|----------|---------|----------|
+| **Green-Purple** | Green | Blue-teal | Deep purple | General use, intuitive warm/cold |
+| **White at 0°C** | White | Purple tones | Deep purple (hot) | Freezing boundary emphasis |
+| **NWS Classic** | Yellow | Indigo/blue | Deep purple | Traditional NWS style |
+
+All defined with °F anchor points, converted to °C internally. 512-bin interpolation with 2°C contour steps.
 
 ## API Endpoints
 
@@ -155,6 +164,7 @@ Uses the NWS NDFD color table with 0°C (freezing) = yellow:
 | `/api/load_cycle` | POST | Load entire cycle (all FHRs) |
 | `/api/unload` | POST | Unload a forecast hour |
 | `/api/xsect` | GET | Generate cross-section PNG |
+| `/api/xsect_gif` | GET | Generate animated GIF of all loaded FHRs |
 | `/api/request_cycle` | POST | Request download of a specific date/init |
 | `/api/favorites` | GET | List community favorites |
 | `/api/favorite` | POST | Save a favorite |
@@ -177,6 +187,7 @@ Parameters:
 - `vscale` - Vertical exaggeration (1.0, 1.5, 2.0)
 - `y_top` - Top of plot in hPa (100, 200, 300, 500, 700)
 - `units` - Distance axis units (`km` or `mi`)
+- `temp_cmap` - Temperature colormap (`green_purple`, `white_zero`, `nws_ndfd`)
 
 ## Architecture
 
@@ -203,9 +214,11 @@ core/
 │   ├── A/B endpoint labels and legend
 │   ├── km/mi unit conversion at render time
 │   ├── Progress callback for field-level tracking
-│   ├── NWS NDFD temperature colormap
+│   ├── 3 selectable temperature colormaps (Green-Purple, White-Zero, NWS)
+│   ├── Terrain masking for contour lines (theta, freezing, isotherms)
 │   ├── Smoke on native hybrid levels (50 levels, not isobaric)
-│   └── Smoke backfill: auto-loads from wrfnat when cache is stale
+│   ├── Smoke backfill: auto-loads from wrfnat when cache is stale
+│   └── GIF animation with terrain-locked frames
 │
 └── cross_section_production.py   # Batch processing
 
@@ -276,7 +289,7 @@ Data is automatically downloaded from NOAA NOMADS (recent, <48h) or AWS archive 
 
 ## Credits
 
-Contributors: @jasonbweather, Sequoiagrove & others
+Contributors: @jasonbweather, justincat66, Sequoiagrove & others
 
 ## Dependencies
 
@@ -298,6 +311,6 @@ For public access: `cloudflared` (Cloudflare Tunnel client)
 ## References
 
 - [HRRR Model](https://rapidrefresh.noaa.gov/hrrr/) - NOAA's 3km CONUS model
-- [NWS NDFD Color Tables](https://www.weather.gov/media/mdl/ndfd/NDFDelem_fullres.pdf) - Temperature colormap reference
+
 - [Petterssen Frontogenesis](https://glossary.ametsoc.org/wiki/Frontogenesis) - AMS Glossary
 - [cfgrib](https://github.com/ecmwf/cfgrib) - GRIB file reader

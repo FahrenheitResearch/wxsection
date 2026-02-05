@@ -22,6 +22,8 @@ from datetime import datetime
 from functools import wraps
 from collections import defaultdict
 
+import imageio.v2 as imageio
+
 from flask import Flask, jsonify, request, send_file, abort
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -631,7 +633,7 @@ class CrossSectionManager:
             'memory_mb': round(mem_mb, 0),
         }
 
-    def generate_cross_section(self, start, end, cycle_key, fhr, style, y_axis='pressure', vscale=1.0, y_top=100, units='km'):
+    def generate_cross_section(self, start, end, cycle_key, fhr, style, y_axis='pressure', vscale=1.0, y_top=100, units='km', terrain_data=None, temp_cmap='green_purple'):
         """Generate a cross-section for a loaded forecast hour."""
         if not self.xsect:
             return None
@@ -662,7 +664,9 @@ class CrossSectionManager:
                 y_axis=y_axis,
                 vscale=vscale,
                 y_top=y_top,
-                units=units
+                units=units,
+                terrain_data=terrain_data,
+                temp_cmap=temp_cmap
             )
             if png_bytes is None:
                 return None
@@ -670,6 +674,27 @@ class CrossSectionManager:
         except Exception as e:
             logger.error(f"Cross-section error: {e}")
             return None
+
+    def get_terrain_data(self, start, end, cycle_key, fhr, style):
+        """Extract terrain data from a forecast hour for consistent GIF frames."""
+        if not self.xsect:
+            return None
+        engine_key = self._engine_key_map.get((cycle_key, fhr))
+        if engine_key is None:
+            return None
+        fhr_data = self.xsect.forecast_hours.get(engine_key)
+        if fhr_data is None:
+            return None
+        n_points = 100
+        import numpy as np
+        path_lats = np.linspace(start[0], end[0], n_points)
+        path_lons = np.linspace(start[1], end[1], n_points)
+        data = self.xsect._interpolate_to_path(fhr_data, path_lats, path_lons, style)
+        return {
+            'surface_pressure': data.get('surface_pressure'),
+            'surface_pressure_hires': data.get('surface_pressure_hires'),
+            'distances_hires': data.get('distances_hires'),
+        }
 
     # Legacy compatibility methods
     def get_available_times(self):
@@ -1336,6 +1361,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <div class="control-group">
                     <label>Style:</label>
                     <select id="style-select"></select>
+                    <select id="temp-cmap-select" style="display:none" title="Temperature color table">
+                        <option value="green_purple">Green-Purple</option>
+                        <option value="white_zero">White at 0°C</option>
+                        <option value="nws_ndfd">NWS Classic</option>
+                    </select>
                     <button class="help-btn" id="help-btn" title="Style explanations & feedback">?</button>
                     <button class="request-btn" id="request-btn" title="Submit feature request">💡</button>
                 </div>
@@ -1379,6 +1409,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     <button id="save-favorite-btn" title="Save current view">💾</button>
                 </div>
                 <button id="swap-btn" title="Swap start/end points">⇄ Swap</button>
+                <button id="gif-btn" title="Generate animated GIF of all loaded FHRs">GIF</button>
+                <select id="gif-speed" title="GIF speed">
+                    <option value="normal">Normal</option>
+                    <option value="slow">Slow</option>
+                </select>
                 <button id="clear-btn">Clear Line</button>
                 <div id="memory-status">
                     <span id="mem-text">0 MB</span>
@@ -1509,7 +1544,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             opt.textContent = label;
             styleSelect.appendChild(opt);
         });
-        styleSelect.onchange = generateCrossSection;
+        const tempCmapSelect = document.getElementById('temp-cmap-select');
+        function updateTempCmapVisibility() {
+            tempCmapSelect.style.display = styleSelect.value === 'temp' ? '' : 'none';
+        }
+        styleSelect.onchange = () => { updateTempCmapVisibility(); generateCrossSection(); };
+        tempCmapSelect.onchange = generateCrossSection;
 
         // =========================================================================
         // Y-Axis Toggle (Pressure / Height)
@@ -2196,9 +2236,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
             const units = document.getElementById('units-select').value;
 
+            const tempCmap = document.getElementById('temp-cmap-select').value;
             const url = `/api/xsect?start_lat=${start.lat}&start_lon=${start.lng}` +
                 `&end_lat=${end.lat}&end_lon=${end.lng}&cycle=${currentCycle}&fhr=${activeFhr}&style=${style}` +
-                `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}&units=${units}`;
+                `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}&units=${units}&temp_cmap=${tempCmap}`;
 
             try {
                 const res = await fetch(url);
@@ -2221,6 +2262,44 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             if (line) { map.removeLayer(line); line = null; }
             document.getElementById('xsect-container').innerHTML =
                 '<div id="instructions">Click two points on the map to draw a cross-section line</div>';
+        };
+
+        // GIF button
+        document.getElementById('gif-btn').onclick = async () => {
+            if (!startMarker || !endMarker || !currentCycle) return;
+            const btn = document.getElementById('gif-btn');
+            btn.disabled = true;
+            btn.textContent = 'GIF...';
+            const start = startMarker.getLatLng();
+            const end = endMarker.getLatLng();
+            const style = document.getElementById('style-select').value;
+            const vscale = document.getElementById('vscale-select').value;
+            const ytop = document.getElementById('ytop-select').value;
+            const units = document.getElementById('units-select').value;
+            const speed = document.getElementById('gif-speed').value;
+            const url = `/api/xsect_gif?start_lat=${start.lat}&start_lon=${start.lng}` +
+                `&end_lat=${end.lat}&end_lon=${end.lng}&cycle=${currentCycle}&style=${style}` +
+                `&y_axis=${currentYAxis}&vscale=${vscale}&y_top=${ytop}&units=${units}&speed=${speed}` +
+                `&temp_cmap=${document.getElementById('temp-cmap-select').value}`;
+            try {
+                const res = await fetch(url);
+                if (!res.ok) {
+                    const err = await res.json();
+                    alert(err.error || 'GIF generation failed');
+                    return;
+                }
+                const blob = await res.blob();
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `xsect_${currentCycle}_${style}.gif`;
+                a.click();
+                URL.revokeObjectURL(a.href);
+            } catch (err) {
+                alert('GIF generation failed: ' + err.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'GIF';
+            }
         };
 
         // Swap start/end button
@@ -2666,12 +2745,71 @@ def api_xsect():
 
     if dist_units not in ('km', 'mi'):
         dist_units = 'km'
-    buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units)
+    temp_cmap_param = request.args.get('temp_cmap', 'green_purple')
+    if temp_cmap_param not in ('green_purple', 'white_zero', 'nws_ndfd'):
+        temp_cmap_param = 'green_purple'
+    buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, temp_cmap=temp_cmap_param)
     if buf is None:
         return jsonify({'error': 'Failed to generate cross-section. Data may not be loaded.'}), 500
 
     touch_cycle_access(cycle_key)
     return send_file(buf, mimetype='image/png')
+
+@app.route('/api/xsect_gif')
+@rate_limit
+def api_xsect_gif():
+    """Generate an animated GIF of all loaded FHRs for a cycle."""
+    try:
+        start = (float(request.args['start_lat']), float(request.args['start_lon']))
+        end = (float(request.args['end_lat']), float(request.args['end_lon']))
+        cycle_key = request.args.get('cycle')
+        style = request.args.get('style', 'wind_speed')
+        y_axis = request.args.get('y_axis', 'pressure')
+        vscale = float(request.args.get('vscale', 1.0))
+        y_top = int(request.args.get('y_top', 100))
+        dist_units = request.args.get('units', 'km')
+    except (KeyError, ValueError) as e:
+        return jsonify({'error': f'Invalid parameters: {e}'}), 400
+
+    if not cycle_key:
+        return jsonify({'error': 'Missing cycle parameter'}), 400
+    if y_axis not in ('pressure', 'height'):
+        y_axis = 'pressure'
+    vscale = max(0.5, min(3.0, vscale))
+    if y_top not in (100, 200, 300, 500, 700):
+        y_top = 100
+    if dist_units not in ('km', 'mi'):
+        dist_units = 'km'
+    gif_temp_cmap = request.args.get('temp_cmap', 'green_purple')
+    if gif_temp_cmap not in ('green_purple', 'white_zero', 'nws_ndfd'):
+        gif_temp_cmap = 'green_purple'
+
+    # Get loaded FHRs for this cycle, sorted
+    loaded_fhrs = sorted(fhr for ck, fhr in data_manager.loaded_items if ck == cycle_key)
+    if len(loaded_fhrs) < 2:
+        return jsonify({'error': f'Need at least 2 loaded FHRs for GIF (have {len(loaded_fhrs)})'}), 400
+
+    # Lock terrain to first FHR so elevation doesn't jitter between frames
+    terrain_data = data_manager.get_terrain_data(start, end, cycle_key, loaded_fhrs[0], style)
+
+    frames = []
+    for fhr in loaded_fhrs:
+        buf = data_manager.generate_cross_section(start, end, cycle_key, fhr, style, y_axis, vscale, y_top, units=dist_units, terrain_data=terrain_data, temp_cmap=gif_temp_cmap)
+        if buf is not None:
+            frames.append(imageio.imread(buf))
+
+    if len(frames) < 2:
+        return jsonify({'error': 'Failed to generate enough frames'}), 500
+
+    speed = request.args.get('speed', 'normal')
+    frame_duration = 1.5 if speed == 'slow' else 0.8
+
+    gif_buf = io.BytesIO()
+    imageio.mimwrite(gif_buf, frames, format='GIF', duration=frame_duration, loop=0)
+    gif_buf.seek(0)
+
+    touch_cycle_access(cycle_key)
+    return send_file(gif_buf, mimetype='image/gif', download_name=f'xsect_{cycle_key}_{style}.gif')
 
 # Legacy endpoint for compatibility
 @app.route('/api/info')

@@ -22,6 +22,9 @@ Focused repo for interactive HRRR cross-section visualization.
 - **GRIB downloads**: `smart_hrrr/orchestrator.py` with parallel threading
 - **Community favorites**: Save/load cross-section configs, 12h expiry
 - **Cloudflare Tunnel**: Public access via `cloudflared`
+- **GIF animation**: `/api/xsect_gif` generates animated GIF of all loaded FHRs, terrain locked to F00, normal/slow speed
+- **Terrain masking**: Theta contours, freezing level, and isotherms masked below terrain surface via `np.ma.masked_where`
+- **Temperature colormaps**: 3 options (green_purple, white_zero, nws_ndfd) via `_build_temp_colormap()`, selectable in UI dropdown
 
 ### Files (14 Python files)
 ```
@@ -48,6 +51,9 @@ tools/unified_dashboard.py
 - **City labels**: `ax.secondary_xaxis(-0.08)` for aligned secondary axis, 120km search radius, `used_cities` set for dedup
 - **Unit conversion**: `dist_scale = KM_TO_MI if use_miles else 1.0` applied to distances at render time, all internal math stays in km
 - **Figure size**: `figsize=(17, 11)`, axes at `[0.06, 0.12, 0.82, 0.68]`
+- **Terrain masking**: `terrain_mask` built from `pressure_levels > surface_pressure[i]`, applied to theta/temperature contours via `np.ma.masked_where`. Wind barbs also masked. contourf left unmasked (terrain fill zorder=5 covers it)
+- **Temperature colormaps**: `_build_temp_colormap(name)` static method returns one of 3 colormaps. All defined as °F anchor arrays `(°F, (R,G,B))`, converted to °C internally. 512-bin `LinearSegmentedColormap`. Param threaded through `get_cross_section()` → `_render_cross_section()` as `temp_cmap`
+- **GIF terrain lock**: GIF endpoint extracts terrain from first FHR via `get_terrain_data()`, passes as `terrain_data` override to all subsequent frames so terrain doesn't jitter with surface pressure changes
 - **Smoke loading**: Uses eccodes (not cfgrib) to read MASSDEN (disc=0, cat=20, num=0) from wrfnat — cfgrib can't identify this field (shows as `unknown`). Kept on **native hybrid levels** (50 levels, ~10-15 packed in lowest 2km) with per-column pressure coordinate — NOT interpolated to isobaric. This preserves boundary layer vertical detail where smoke concentrates. Stored as `smoke_hyb` + `smoke_pres_hyb` in ForecastHourData and NPZ cache. Units: kg/m³ × 10⁹ = μg/m³. Plotted with its own X/Y mesh (pressure varies per column due to terrain).
 - **Smoke backfill**: When loading from NPZ cache, if `smoke_hyb` is missing but wrfnat file exists, smoke is automatically loaded from wrfnat and cache is updated. Handles transition from pre-smoke caches.
 - **Auto-update wrfnat awareness**: `auto_update.py` checks for wrfnat completeness — an FHR is only "downloaded" if wrfprs AND wrfnat both exist. Downloads wrfprs, wrfsfc, and wrfnat for all cycles.
