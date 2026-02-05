@@ -845,11 +845,16 @@ class InteractiveCrossSection:
                 mem_mb = fhr_data.memory_usage_mb()
                 print(f"  Loaded F{forecast_hour:02d} in {duration:.1f}s ({mem_mb:.0f} MB)")
 
-                # Save to mmap cache for fast subsequent loads
+                # Save to mmap cache, then reload as mmap to free RAM
                 if mmap_dir:
                     try:
                         self._save_to_mmap_cache(fhr_data, mmap_dir)
-                        print(f"  Cached to {mmap_dir.name}/ (mmap)")
+                        fhr_mmap = self._load_from_mmap_cache(mmap_dir)
+                        if fhr_mmap is not None:
+                            self.forecast_hours[forecast_hour] = fhr_mmap
+                            print(f"  Cached to {mmap_dir.name}/ (mmap, {fhr_mmap.memory_usage_mb():.0f} MB heap)")
+                        else:
+                            print(f"  Cached to {mmap_dir.name}/ (mmap)")
                     except Exception as e:
                         print(f"  Warning: Could not cache: {e}")
 
