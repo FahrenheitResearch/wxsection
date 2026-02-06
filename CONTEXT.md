@@ -141,6 +141,9 @@ Status file: auto_update writes /tmp/auto_update_status.json with per-model
   progress (cycle, total, done, in_flight FHRs). Dashboard reads this to
   show download progress in the activity panel.
 
+Availability lag (minutes after init before checking):
+  HRRR: 50min, GFS: 180min (3h), RRFS: 120min (2h)
+
 Cycle targeting:
   - HRRR: latest 2 cycles (for base FHRs)
   - GFS/RRFS: latest cycle only (no handoff)
@@ -219,10 +222,10 @@ HRRR synoptic (49 FHR): ~61GB GRIB, ~113GB cache
 ## Features
 
 ### What Works
-- **Dashboard**: `tools/unified_dashboard.py` — Flask + Leaflet, live at wxsection.com:5561
+- **Dashboard**: `tools/unified_dashboard.py` — Flask + Leaflet (OpenTopoMap), live at wxsection.com:5561
 - **Cross-section engine**: `core/cross_section_interactive.py` — 0.5s warm renders
 - **Multi-model**: HRRR, GFS, RRFS support everywhere
-- **15 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis, smoke
+- **19 styles**: wind_speed, temp, theta_e, rh, q, omega, vorticity, shear, lapse_rate, cloud, cloud_total, wetbulb, icing, frontogenesis, smoke, vpd, dewpoint_dep, moisture_transport, pv
 - **Run picker**: Filtered to preload window + loaded archive cycles only
 - **Archive requests**: Modal with date picker, hour selector, FHR range (admin-gated)
 - **Activity panel**: Real-time progress for all operations (preload, auto-load, download, prerender, auto-update)
@@ -277,7 +280,7 @@ STATUS_FILE = '/tmp/auto_update_status.json'  # IPC to dashboard
 ## Known Issues / TODO
 
 1. **Delete orphaned VHD cache**: `rm -rf /mnt/hrrr/cache/xsect/` frees ~348GB on VHD (no longer used after NVMe migration)
-2. **GRIB-to-mmap is the #1 bottleneck**: 23s/FHR with 4 threads, GIL-bound. See "CRITICAL ISSUE" section above for investigation paths.
+2. **GRIB-to-mmap is the #1 bottleneck**: ~15s/FHR with eccodes, 4 threads, GIL-bound. See "GRIB-to-mmap Conversion Performance" section above.
 3. **ProcessPoolExecutor broken on WSL2**: folio contention, all workers D-state. Would need native Linux or different GRIB library
 4. **GFS/RRFS rendering**: Works but needs more testing at extended FHRs
 5. **VHD remount required**: After every WSL/PC restart, run `start.sh` or mount manually

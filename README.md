@@ -33,9 +33,9 @@ XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py
 ## Features
 
 ### Interactive Web Dashboard
-- **Leaflet map** with click-to-place markers and draggable endpoints
+- **Leaflet map** (OpenTopoMap) with click-to-place markers and draggable endpoints
 - **Multi-model support**: HRRR (3km), GFS (0.25deg), RRFS (3km) with model selector dropdown
-- **15 visualization styles** via dropdown with community voting
+- **19 visualization styles** via dropdown with community voting
 - **Up to 48 forecast hours** with color-coded chip system (synoptic HRRR cycles: F00-F48, others: F00-F18):
   - **Grey** = on disk, not opened (click to open via mmap, ~14ms if cached)
   - **Green** = opened (mmap handles ready, click for instant view)
@@ -136,13 +136,21 @@ XSECT_GRIB_BACKEND=auto WXSECTION_KEY=your_key python tools/unified_dashboard.py
 | `shear` | Wind shear (1/s) | Turbulence, jet cores |
 | `lapse_rate` | Temp lapse rate (C/km) | Stability analysis |
 
+### Derived / Diagnostic
+| Style | Shows | Use For |
+|-------|-------|---------|
+| `vpd` | Vapor pressure deficit (hPa) | Fire weather, plant stress |
+| `dewpoint_dep` | T minus Td (C) | Dry layers, cloud base ID |
+| `moisture_transport` | q times wind speed (g·m/kg/s) | Atmospheric rivers, moisture plumes |
+| `pv` | Potential vorticity (PVU) | Tropopause folds, jet dynamics |
+
 ### All Styles Include
 - **Theta contours** (black lines) - atmospheric stability, masked below terrain
 - **Wind barbs** with actual U and V components, masked below terrain
 - **Freezing level** (magenta line) - 0C isotherm, masked below terrain
 - **Terrain fill** (brown) - hi-res ~1.5km sampling with bilinear interpolation
 - **A/B endpoint markers** on plot and inset map
-- **City labels** with lat/lon and distance along path
+- **Lat/lon tick labels** with distance along path
 
 ## Architecture
 

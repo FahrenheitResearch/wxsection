@@ -74,7 +74,7 @@ MODEL_DEFAULT_MAX_FHR = {
 # Per-model: data availability lag (minutes after init time)
 MODEL_AVAILABILITY_LAG = {
     'hrrr': 50,
-    'gfs':  240,   # GFS takes ~4 hours to start publishing
+    'gfs':  180,   # GFS takes ~3 hours to start publishing
     'rrfs': 120,   # RRFS takes ~2 hours
 }
 

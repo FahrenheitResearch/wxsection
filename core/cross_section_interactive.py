@@ -107,6 +107,7 @@ class ClimatologyData:
 ANOMALY_STYLES = {
     'temp', 'wind_speed', 'rh', 'omega', 'theta_e',
     'q', 'vorticity', 'shear', 'lapse_rate', 'wetbulb',
+    'vpd', 'dewpoint_dep', 'moisture_transport',
 }
 
 
@@ -1653,6 +1654,30 @@ class InteractiveCrossSection:
                            - 4.686035)
                 data['anomaly'] = data['wetbulb'] - climo_tw
 
+        elif style == 'vpd':
+            if 'vpd' in data and 'temperature' in climo_path and 'rh' in climo_path:
+                climo_tc = climo_path['temperature'] - 273.15
+                climo_rh = climo_path['rh']
+                climo_es = 6.1078 * np.exp(17.27 * climo_tc / (climo_tc + 237.3))
+                climo_vpd = climo_es * (1.0 - climo_rh / 100.0)
+                data['anomaly'] = data['vpd'] - climo_vpd
+
+        elif style == 'dewpoint_dep':
+            if 'dewpoint_dep' in data and 'temperature' in climo_path and 'dew_point' in climo_path:
+                climo_tc = climo_path['temperature'] - 273.15
+                climo_td_c = climo_path['dew_point'] - 273.15
+                climo_dd = climo_tc - climo_td_c
+                data['anomaly'] = data['dewpoint_dep'] - climo_dd
+
+        elif style == 'moisture_transport':
+            if 'moisture_transport' in data and 'specific_humidity' in climo_path and 'u_wind' in climo_path and 'v_wind' in climo_path:
+                climo_q = climo_path['specific_humidity']
+                climo_u = climo_path['u_wind']
+                climo_v = climo_path['v_wind']
+                climo_ws = np.sqrt(climo_u**2 + climo_v**2)
+                climo_mt = climo_q * 1000.0 * climo_ws
+                data['anomaly'] = data['moisture_transport'] - climo_mt
+
         return data
 
     def get_cross_section(
@@ -2008,6 +2033,45 @@ class InteractiveCrossSection:
             icing = np.where((T_c >= -20) & (T_c <= 0), cloud, 0)
             result['icing'] = icing
 
+        if style == 'vpd' and fhr_data.rh is not None:
+            RH = interp_3d(fhr_data.rh)
+            result['rh'] = RH
+            T_c = result['temp_c']
+            # Tetens formula for saturation vapor pressure (hPa)
+            es = 6.1078 * np.exp(17.27 * T_c / (T_c + 237.3))
+            result['vpd'] = es * (1.0 - RH / 100.0)
+
+        if style == 'dewpoint_dep' and fhr_data.dew_point is not None:
+            td = interp_3d(fhr_data.dew_point)
+            td_c = td - 273.15
+            result['dewpoint_dep'] = result['temp_c'] - td_c
+
+        if style == 'moisture_transport' and fhr_data.specific_humidity is not None:
+            q = interp_3d(fhr_data.specific_humidity)
+            result['specific_humidity'] = q
+            u = result.get('u_wind')
+            v = result.get('v_wind')
+            if u is not None and v is not None:
+                wind_speed = np.sqrt(u**2 + v**2)
+                result['moisture_transport'] = q * 1000.0 * wind_speed  # g/kg * m/s
+
+        if style == 'pv' and fhr_data.vorticity is not None:
+            vort = interp_3d(fhr_data.vorticity)
+            result['vorticity'] = vort
+            theta = result['theta']
+            p_levels = fhr_data.pressure_levels  # hPa
+            n_lev = len(p_levels)
+            # Centered finite difference for dθ/dp
+            dtheta_dp = np.zeros_like(theta)
+            for lev in range(1, n_lev - 1):
+                dp = (p_levels[lev + 1] - p_levels[lev - 1]) * 100.0  # hPa → Pa
+                dtheta_dp[lev, :] = (theta[lev + 1, :] - theta[lev - 1, :]) / dp
+            dtheta_dp[0, :] = dtheta_dp[1, :]
+            dtheta_dp[-1, :] = dtheta_dp[-2, :]
+            g = 9.81
+            pv = -g * vort * dtheta_dp  # K m² kg⁻¹ s⁻¹
+            result['pv'] = pv * 1e6  # Convert to PVU
+
         if style == 'frontogenesis':
             # Petterssen Kinematic Frontogenesis (Winter Bander Mode)
             # Compute frontogenesis on the cross-section using NumPy
@@ -2298,7 +2362,8 @@ class InteractiveCrossSection:
         # Note: smoke_hyb/smoke_pres_hyb are on native hybrid levels, not isobaric — filtered separately in render
         for key in ['rh', 'omega', 'vorticity', 'cloud', 'temperature', 'temp_c',
                     'specific_humidity', 'theta_e', 'shear', 'dew_point', 'frontogenesis',
-                    'icing', 'wetbulb', 'lapse_rate']:
+                    'icing', 'wetbulb', 'lapse_rate',
+                    'vpd', 'dewpoint_dep', 'moisture_transport', 'pv']:
             if key in data and data[key] is not None and data[key].ndim == 2:
                 data[key] = filter_levels(data[key])
 
@@ -2615,6 +2680,63 @@ class InteractiveCrossSection:
                     pass
 
                 shading_label = "❄ Frontogenesis"
+        elif style == "vpd":
+            vpd = data.get('vpd')
+            if vpd is not None:
+                # Green (moist) → Yellow → Orange → Red (dry/fire risk)
+                vpd_colors = ['#1a9850', '#66bd63', '#a6d96a', '#d9ef8b',
+                              '#fee08b', '#fdae61', '#f46d43', '#d73027', '#a50026']
+                vpd_cmap = mcolors.LinearSegmentedColormap.from_list('vpd', vpd_colors, N=256)
+                cf = ax.contourf(X, Y, vpd, levels=np.arange(0, 65, 5), cmap=vpd_cmap, extend='max')
+                cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar.set_label('VPD (hPa)')
+                shading_label = "VPD"
+        elif style == "dewpoint_dep":
+            dd = data.get('dewpoint_dep')
+            if dd is not None:
+                # Green (saturated) → Yellow → Brown (very dry)
+                dd_colors = ['#006837', '#1a9850', '#66bd63', '#a6d96a', '#d9ef8b',
+                             '#fee08b', '#fdae61', '#f46d43', '#d73027', '#a50026']
+                dd_cmap = mcolors.LinearSegmentedColormap.from_list('dd', dd_colors, N=256)
+                cf = ax.contourf(X, Y, dd, levels=np.arange(0, 42, 2), cmap=dd_cmap, extend='max')
+                cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar.set_label('Dewpoint Depression (°C)')
+                # Saturation line (dd=0)
+                try:
+                    cs_sat = ax.contour(X, Y, dd, levels=[0], colors='cyan', linewidths=2.5)
+                    ax.clabel(cs_sat, inline=True, fontsize=9, fmt='SAT', colors='black')
+                except:
+                    pass
+                shading_label = "T-Td"
+        elif style == "moisture_transport":
+            mt = data.get('moisture_transport')
+            if mt is not None:
+                cf = ax.contourf(X, Y, mt, levels=np.linspace(0, 200, 21), cmap='YlGnBu', extend='max')
+                cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar.set_label('Moisture Transport (g·m/kg/s)')
+                shading_label = "q·V"
+        elif style == "pv":
+            pv = data.get('pv')
+            if pv is not None:
+                # Stratospheric PV is large positive; tropospheric is small
+                pv_colors = ['#543005', '#8c510a', '#bf812d', '#dfc27d', '#f6e8c3',
+                             '#f5f5f5',
+                             '#c7eae5', '#80cdc1', '#35978f', '#01665e', '#003c30']
+                pv_cmap = mcolors.LinearSegmentedColormap.from_list('pv', pv_colors, N=256)
+                cf = ax.contourf(X, Y, pv, levels=np.arange(-2, 10.5, 0.5), cmap=pv_cmap, extend='both')
+                cbar_ax = fig.add_axes([0.90, 0.12, 0.012, 0.68])
+                cbar = plt.colorbar(cf, cax=cbar_ax)
+                cbar.set_label('Potential Vorticity (PVU)')
+                # 2 PVU dynamical tropopause
+                try:
+                    cs_trop = ax.contour(X, Y, pv, levels=[2], colors='magenta', linewidths=2.5)
+                    ax.clabel(cs_trop, inline=True, fontsize=9, fmt='2 PVU', colors='black')
+                except:
+                    pass
+                shading_label = "PV"
         else:
             # Default to theta shading
             if theta is not None:
@@ -2798,79 +2920,16 @@ class InteractiveCrossSection:
         fig.text(0.88, 0.045, b_label, ha='right', va='top', fontsize=8, fontweight='bold',
                 color='#333', transform=fig.transFigure)
 
-        # Lat/lon + nearby city labels along x-axis
-        _cities = [
-            # Major metros
-            (40.71, -74.01, "New York"), (34.05, -118.24, "Los Angeles"), (41.88, -87.63, "Chicago"),
-            (29.76, -95.37, "Houston"), (33.45, -112.07, "Phoenix"), (29.95, -90.07, "New Orleans"),
-            (39.74, -104.99, "Denver"), (47.61, -122.33, "Seattle"), (25.76, -80.19, "Miami"),
-            (33.75, -84.39, "Atlanta"), (42.36, -71.06, "Boston"), (38.91, -77.04, "Washington DC"),
-            (32.72, -96.97, "Dallas"), (37.77, -122.42, "San Francisco"), (36.17, -115.14, "Las Vegas"),
-            (39.96, -82.99, "Columbus"), (35.23, -80.84, "Charlotte"), (44.98, -93.27, "Minneapolis"),
-            (30.27, -97.74, "Austin"), (32.22, -110.93, "Tucson"), (36.16, -86.78, "Nashville"),
-            (45.52, -122.68, "Portland OR"), (38.63, -90.20, "St. Louis"), (39.10, -94.58, "Kansas City"),
-            (35.47, -97.52, "Oklahoma City"), (37.34, -121.89, "San Jose"),
-            (40.76, -111.89, "Salt Lake City"), (43.62, -116.21, "Boise"), (42.33, -83.05, "Detroit"),
-            (39.77, -86.16, "Indianapolis"), (41.26, -95.94, "Omaha"), (28.54, -81.38, "Orlando"),
-            (27.95, -82.46, "Tampa"), (30.33, -81.66, "Jacksonville"), (40.44, -79.99, "Pittsburgh"),
-            # Mid-size & regional
-            (35.96, -83.92, "Knoxville"), (36.85, -75.98, "Virginia Beach"), (43.04, -87.91, "Milwaukee"),
-            (34.73, -92.33, "Little Rock"), (32.30, -90.18, "Jackson MS"), (37.54, -77.44, "Richmond"),
-            (42.89, -78.88, "Buffalo"), (43.05, -76.15, "Syracuse"), (41.76, -72.68, "Hartford"),
-            (46.87, -114.00, "Missoula"), (47.66, -117.43, "Spokane"), (35.08, -106.65, "Albuquerque"),
-            (31.77, -106.44, "El Paso"), (37.69, -97.34, "Wichita"), (38.80, -97.61, "Salina"),
-            (41.59, -93.62, "Des Moines"), (40.81, -96.70, "Lincoln"), (46.81, -100.78, "Bismarck"),
-            (38.04, -84.50, "Lexington"), (34.00, -81.03, "Columbia SC"), (36.07, -79.79, "Greensboro"),
-            (26.12, -80.14, "Fort Lauderdale"), (43.66, -70.26, "Portland ME"),
-            # Western US fill (sparse areas)
-            (38.57, -121.49, "Sacramento"), (36.75, -119.77, "Fresno"), (35.37, -119.02, "Bakersfield"),
-            (34.42, -119.70, "Santa Barbara"), (33.43, -117.61, "San Clemente"),
-            (33.95, -117.40, "Riverside"), (32.72, -117.16, "San Diego"),
-            (36.60, -121.89, "Monterey"), (40.59, -122.39, "Redding"), (42.32, -122.87, "Medford"),
-            (39.53, -119.81, "Reno"), (38.80, -112.08, "Richfield UT"), (39.17, -119.77, "Carson City"),
-            (40.83, -115.76, "Elko"), (38.54, -109.55, "Moab"), (37.10, -113.58, "St. George"),
-            (39.64, -106.37, "Vail"), (38.27, -104.76, "Pueblo"), (40.59, -105.08, "Fort Collins"),
-            (35.20, -101.83, "Amarillo"), (33.58, -101.85, "Lubbock"), (31.97, -99.90, "Abilene"),
-            (27.80, -97.40, "Corpus Christi"), (32.45, -100.43, "Sweetwater"),
-            (41.14, -104.82, "Cheyenne"), (42.87, -106.33, "Casper"), (44.77, -108.73, "Cody"),
-            (43.48, -110.76, "Jackson WY"), (46.60, -112.04, "Helena"),
-            (48.76, -122.47, "Bellingham"), (44.06, -121.31, "Bend OR"),
-            (46.73, -117.00, "Lewiston ID"), (44.26, -72.58, "Montpelier"),
-            (43.21, -71.54, "Concord NH"), (41.82, -71.41, "Providence"),
-            (39.16, -75.52, "Dover"), (44.37, -100.35, "Pierre SD"), (44.97, -89.63, "Wausau"),
-            (38.58, -92.17, "Jefferson City"), (37.22, -93.29, "Springfield MO"),
-            (36.40, -105.57, "Taos"), (34.51, -105.38, "Roswell"), (32.34, -106.76, "Las Cruces"),
-            (48.23, -101.30, "Minot"), (47.51, -111.28, "Great Falls"),
-            (39.83, -98.53, "Smith Center KS"), (41.13, -100.77, "North Platte"),
-            (44.08, -103.23, "Rapid City"), (38.73, -116.69, "Tonopah"),
-            (37.23, -115.02, "Alamo NV"), (40.84, -111.89, "SLC"),
-            (21.31, -157.86, "Honolulu"), (61.22, -149.90, "Anchorage"),
-        ]
+        # Lat/lon labels along x-axis
         n_ticks = min(8, max(3, int(total_dist / 200)))  # ~1 tick per 200km
         tick_indices = np.linspace(0, len(distances) - 1, n_ticks + 2, dtype=int)[1:-1]  # Skip A/B endpoints
 
         tick_positions = []
         tick_labels = []
-        used_cities = set()  # Prevent same city appearing twice
         for idx in tick_indices:
             d = distances[idx]
             lat_i, lon_i = lats[idx], lons[idx]
-
-            # Find nearest city within 120km that hasn't been used
-            best_city = None
-            best_dist = 120  # km threshold
-            for clat, clon, cname in _cities:
-                if cname in used_cities:
-                    continue
-                cdist = np.sqrt(((lat_i - clat) * 111) ** 2 + (((lon_i - clon) * 111 * np.cos(np.radians(lat_i)))) ** 2)
-                if cdist < best_dist:
-                    best_dist = cdist
-                    best_city = cname
-
             label = f"{abs(lat_i):.1f}°{'N' if lat_i >= 0 else 'S'}, {abs(lon_i):.1f}°{'W' if lon_i < 0 else 'E'}"
-            if best_city:
-                label += f"\n{best_city}"
-                used_cities.add(best_city)
             label += f"\n{d:.0f} {dist_unit}"
             tick_positions.append(d)
             tick_labels.append(label)

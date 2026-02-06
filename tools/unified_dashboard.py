@@ -70,6 +70,10 @@ PRODUCT_TO_STYLE = {
     'icing': 'icing',
     'frontogenesis': 'frontogenesis',
     'smoke': 'smoke',
+    'vpd': 'vpd', 'vapor_pressure_deficit': 'vpd',
+    'dewpoint_dep': 'dewpoint_dep', 'dewpoint_depression': 'dewpoint_dep',
+    'moisture_transport': 'moisture_transport',
+    'pv': 'pv', 'potential_vorticity': 'pv',
 }
 PRODUCTS_INFO = [
     {'id': 'temperature', 'name': 'Temperature', 'units': '\u00b0C'},
@@ -86,6 +90,10 @@ PRODUCTS_INFO = [
     {'id': 'icing', 'name': 'Icing Potential', 'units': 'g/kg'},
     {'id': 'frontogenesis', 'name': 'Frontogenesis', 'units': 'K/100km/3hr'},
     {'id': 'smoke', 'name': 'PM2.5 Smoke', 'units': '\u03bcg/m\u00b3'},
+    {'id': 'vpd', 'name': 'Vapor Pressure Deficit', 'units': 'hPa'},
+    {'id': 'dewpoint_dep', 'name': 'Dewpoint Depression', 'units': '\u00b0C'},
+    {'id': 'moisture_transport', 'name': 'Moisture Transport', 'units': 'g\u00b7m/kg/s'},
+    {'id': 'pv', 'name': 'Potential Vorticity', 'units': 'PVU'},
 ]
 
 def load_votes():
@@ -393,6 +401,10 @@ XSECT_STYLES = [
     ('icing', 'Icing Potential'),
     ('frontogenesis', '❄ Frontogenesis'),  # Winter Bander mode
     ('smoke', 'PM2.5 Smoke'),
+    ('vpd', 'Vapor Pressure Deficit'),
+    ('dewpoint_dep', 'Dewpoint Depression'),
+    ('moisture_transport', 'Moisture Transport'),
+    ('pv', 'Potential Vorticity'),
 ]
 
 # =============================================================================
@@ -2772,8 +2784,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             minZoom: 4,
             maxZoom: 10
         });
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-            attribution: '&copy; OpenStreetMap, &copy; CARTO'
+        L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap, &copy; OpenTopoMap'
         }).addTo(map);
 
         // Inset map removed - cross-section path shown in matplotlib plot inset

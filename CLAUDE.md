@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Multi-model atmospheric cross-section generator. Users draw a line on a map, get an instant vertical cross-section from HRRR, GFS, or RRFS weather model data. Live at **wxsection.com**.
+Multi-model atmospheric cross-section generator. Users draw a line on a map, get an instant vertical cross-section from HRRR, GFS, or RRFS weather model data. Live at **wxsection.com**. 19 visualization styles, all derived from cached fields.
 
 ## Architecture Summary
 
@@ -140,6 +140,8 @@ Auto-update uses slot-based concurrency (`run_download_pass_concurrent`):
 - HRRR queue refreshes every 45s for newly published FHRs
 - `download_forecast_hour` requires ALL file types to succeed (wrfprs + wrfsfc + wrfnat for HRRR)
 - Writes progress to `/tmp/auto_update_status.json` on every schedule/completion event (atomically via tmp+rename)
+
+**Availability lag**: HRRR 50min, GFS 180min (3h), RRFS 120min after init time. Set in `MODEL_AVAILABILITY_LAG`.
 
 **NOMADS is the bottleneck**: ~6-7 MB/s per connection regardless of local bandwidth.
 5 concurrent connections = ~265 Mbps sustained. Safe up to ~7-8 before throttling risk.
